@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -23,6 +24,7 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from backend.config import Settings
@@ -32,6 +34,7 @@ from backend.models.database import (
     ModelRelease,
     ModelReleaseSignal,
     Paper,
+    PaperCurationBootstrapBundle,
     PaperCurationJob,
     PaperCurationSchedulerState,
     PaperCurationWorkflow,
@@ -67,6 +70,19 @@ SCHEDULED_TRIGGERS = frozenset(
     {"hf-daily-cron", "hf-trending-cron", BENCHMARK_GAP_TRIGGER, RADAR_TRIGGER}
 )
 BENCHMARK_GAP_MAX_ACTIVE = 2
+
+
+def operator_retryable(row: PaperCurationJob) -> bool:
+    """Scheduled stages an operator may retry or canary-dispatch by job id.
+
+    Benchmark-promotion add-evals rows re-score one paper on the scheduled
+    benchmark-gap lane, so they qualify alongside daily and trending stages.
+    """
+    return row.trigger in {"hf-daily-cron", "hf-trending-cron"} or (
+        row.trigger == BENCHMARK_GAP_TRIGGER and row.kind == "add-evals"
+    )
+
+
 # Health breakers that count only daily/trending paper stages. The daily
 # benchmark-gap overseer is unrelated to them, so they must not hold it back.
 SCHEDULED_HEALTH_PAUSES = frozenset(
@@ -204,6 +220,18 @@ def _is_callback_validation_rejection(row: PaperCurationJob) -> bool:
     return (getattr(row, "validation_summary", None) or {}).get("status") == "rejected"
 
 
+# The runner's generic failure for a callback that never got a response: the
+# HF Job could not reach the site, which says nothing about the curation itself.
+_TRANSPORT_FAILURE = re.compile(
+    r"^Remote runner failed \((URLError|RemoteDisconnected|TimeoutError|"
+    r"ConnectionResetError|IncompleteRead)\)\.$"
+)
+
+
+def _is_transport_failure(error: str | None) -> bool:
+    return _TRANSPORT_FAILURE.match(error or "") is not None
+
+
 def _is_source_evidence_failure(error: str | None) -> bool:
     if parse_failure_code(error) == AWAITING_MARKDOWN:
         return True
@@ -245,8 +273,39 @@ def _curator_bootstrap_bundle(revision: str) -> dict:
     return {"revision": revision, "files": files}
 
 
-def _validated_bootstrap_bundle(row: PaperCurationJob) -> dict:
-    bundle = row.bootstrap_bundle
+def _bootstrap_bundle_key(bundle: dict) -> str:
+    canonical = json.dumps(bundle, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _store_bootstrap_bundle(db: Session, revision: str) -> str | None:
+    """Store the release's bootstrap snapshot once and return its content key."""
+    if len(revision) != 40:
+        return None
+    bundle = _curator_bootstrap_bundle(revision)
+    key = _bootstrap_bundle_key(bundle)
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            pg_insert(PaperCurationBootstrapBundle)
+            .values(sha256=key, bundle=bundle)
+            .on_conflict_do_nothing()
+        )
+    elif db.get(PaperCurationBootstrapBundle, key) is None:
+        db.add(PaperCurationBootstrapBundle(sha256=key, bundle=bundle))
+        db.flush()
+    return key
+
+
+def _persisted_bootstrap_bundle(row: PaperCurationJob) -> dict | None:
+    if row.bootstrap_bundle_sha256 is None:
+        return None
+    bundle = row.stored_bootstrap_bundle.bundle
+    if _bootstrap_bundle_key(bundle) != row.bootstrap_bundle_sha256:
+        raise ValueError("Persisted bootstrap bundle does not match its key")
+    return bundle
+
+
+def _validated_bootstrap_bundle(row: PaperCurationJob, bundle: dict) -> dict:
     if not isinstance(bundle, dict) or bundle.get("revision") != row.repository_sha:
         raise ValueError("Persisted bootstrap revision does not match the job")
     files = bundle.get("files")
@@ -432,11 +491,7 @@ class CodexPaperJobService:
         commit: bool = True,
     ) -> CodexPaperJob:
         repository_sha = _git_revision()
-        bootstrap_bundle = (
-            _curator_bootstrap_bundle(repository_sha)
-            if len(repository_sha) == 40
-            else None
-        )
+        bootstrap_bundle_sha256 = _store_bootstrap_bundle(db, repository_sha)
         row = PaperCurationJob(
             id=uuid.uuid4(),
             kind=kind,
@@ -459,7 +514,7 @@ class CodexPaperJobService:
             else (0 if trigger == "admin" else 100),
             repository_sha=repository_sha if len(repository_sha) == 40 else None,
             skill_sha256=_curator_skill_digest(kind),
-            bootstrap_bundle=bootstrap_bundle,
+            bootstrap_bundle_sha256=bootstrap_bundle_sha256,
             model=settings.codex_jobs_model,
             reasoning_effort=settings.codex_jobs_reasoning_effort,
             codex_cli_version=settings.codex_jobs_cli_version,
@@ -506,11 +561,7 @@ class CodexPaperJobService:
             priority=25,
             repository_sha=repository_sha if len(repository_sha) == 40 else None,
             skill_sha256=_curator_skill_digest("resolve-model-paper"),
-            bootstrap_bundle=(
-                _curator_bootstrap_bundle(repository_sha)
-                if len(repository_sha) == 40
-                else None
-            ),
+            bootstrap_bundle_sha256=_store_bootstrap_bundle(db, repository_sha),
             model=settings.codex_jobs_model,
             reasoning_effort=settings.codex_jobs_reasoning_effort,
             codex_cli_version=settings.codex_jobs_cli_version,
@@ -558,11 +609,7 @@ class CodexPaperJobService:
             priority=25,
             repository_sha=repository_sha if len(repository_sha) == 40 else None,
             skill_sha256=_curator_skill_digest("resolve-model-paper"),
-            bootstrap_bundle=(
-                _curator_bootstrap_bundle(repository_sha)
-                if len(repository_sha) == 40
-                else None
-            ),
+            bootstrap_bundle_sha256=_store_bootstrap_bundle(db, repository_sha),
             model=settings.codex_jobs_model,
             reasoning_effort=settings.codex_jobs_reasoning_effort,
             codex_cli_version=settings.codex_jobs_cli_version,
@@ -612,11 +659,7 @@ class CodexPaperJobService:
             priority=priority,
             repository_sha=repository_sha if len(repository_sha) == 40 else None,
             skill_sha256=_curator_skill_digest(kind),
-            bootstrap_bundle=(
-                _curator_bootstrap_bundle(repository_sha)
-                if len(repository_sha) == 40
-                else None
-            ),
+            bootstrap_bundle_sha256=_store_bootstrap_bundle(db, repository_sha),
             model=settings.codex_jobs_model,
             reasoning_effort=settings.codex_jobs_reasoning_effort,
             codex_cli_version=settings.codex_jobs_cli_version,
@@ -792,7 +835,7 @@ class CodexPaperJobService:
         bind = get_bind() if get_bind is not None else None
         if bind is not None and bind.dialect.name == "postgresql":
             db.refresh(row, with_for_update=True)
-        if row.trigger not in {"hf-daily-cron", "hf-trending-cron"}:
+        if not operator_retryable(row):
             raise ValueError("Only scheduled curation jobs may be canary-dispatched")
         if row.status != "queued":
             raise ValueError("Canary dispatch requires a queued curation job")
@@ -813,10 +856,15 @@ class CodexPaperJobService:
         )
         if len(active) >= settings.codex_jobs_max_active:
             raise RuntimeError("No Codex Job capacity is available")
-        scheduled_active = sum(
-            item.trigger in {"hf-daily-cron", "hf-trending-cron"} for item in active
-        )
-        if scheduled_active >= settings.codex_jobs_max_scheduled_active:
+        if row.trigger == BENCHMARK_GAP_TRIGGER:
+            lane_active = sum(item.trigger == BENCHMARK_GAP_TRIGGER for item in active)
+            lane_limit = BENCHMARK_GAP_MAX_ACTIVE
+        else:
+            lane_active = sum(
+                item.trigger in {"hf-daily-cron", "hf-trending-cron"} for item in active
+            )
+            lane_limit = settings.codex_jobs_max_scheduled_active
+        if lane_active >= lane_limit:
             raise RuntimeError("No scheduled curation capacity is available")
         self._dispatch_row(db, settings, row)
         if row.status != "running" or not row.hf_job_id:
@@ -1070,7 +1118,7 @@ class CodexPaperJobService:
             return
 
         try:
-            self._bind_active_release(row, settings)
+            self._bind_active_release(db, row, settings)
             callback_token = secrets.token_urlsafe(32)
             row.status = "dispatching"
             row.callback_token_hash = hashlib.sha256(
@@ -1118,7 +1166,9 @@ class CodexPaperJobService:
             db.commit()
 
     @staticmethod
-    def _bind_active_release(row: PaperCurationJob, settings: Settings) -> None:
+    def _bind_active_release(
+        db: Session, row: PaperCurationJob, settings: Settings
+    ) -> None:
         """Bind an unstarted queue row to the release that will serve bootstrap."""
         revision = _git_revision()
         if len(revision) != 40:
@@ -1128,7 +1178,7 @@ class CodexPaperJobService:
         previous = row.repository_sha
         row.repository_sha = revision
         row.skill_sha256 = _curator_skill_digest(row.kind)
-        row.bootstrap_bundle = _curator_bootstrap_bundle(revision)
+        row.bootstrap_bundle_sha256 = _store_bootstrap_bundle(db, revision)
         row.model = settings.codex_jobs_model
         row.reasoning_effort = settings.codex_jobs_reasoning_effort
         row.codex_cli_version = settings.codex_jobs_cli_version
@@ -1613,8 +1663,9 @@ class CodexPaperJobService:
 
     def bootstrap_bundle(self, row: PaperCurationJob) -> dict:
         """Return the job's hash-validated minimal curation worktree."""
-        if getattr(row, "bootstrap_bundle", None) is not None:
-            return _validated_bootstrap_bundle(row)
+        bundle = _persisted_bootstrap_bundle(row)
+        if bundle is not None:
+            return _validated_bootstrap_bundle(row, bundle)
         revision = _git_revision()
         if row.repository_sha != revision:
             raise ValueError("Job revision does not match the active immutable release")
@@ -1778,8 +1829,10 @@ class CodexPaperJobService:
         state = db.get(PaperCurationSchedulerState, 1)
         if state is None:
             return
-        source_failure = _is_source_evidence_failure(row.error)
-        if row.status == "failed" and not source_failure:
+        uncounted = _is_source_evidence_failure(row.error) or _is_transport_failure(
+            row.error
+        )
+        if row.status == "failed" and not uncounted:
             state.consecutive_apply_failures += 1
         elif row.status == "completed":
             state.consecutive_apply_failures = 0
@@ -1803,12 +1856,25 @@ class CodexPaperJobService:
             .limit(25)
             .all()
         )
+        failed = [item for item in recent if item.status == "failed"]
+        transport_failures = [
+            item for item in failed if _is_transport_failure(item.error)
+        ]
         counted_failures = [
             item
-            for item in recent
-            if item.status == "failed" and not _is_source_evidence_failure(item.error)
+            for item in failed
+            if not _is_source_evidence_failure(item.error)
+            and not _is_transport_failure(item.error)
         ]
-        if len(recent) == 25 and len(counted_failures) / 25 > 0.20:
+        if len(recent) == 25 and len(transport_failures) / 25 > 0.50:
+            # Retried transport failures are noise, but a run of them means the
+            # runners cannot reach the site at all, so this pause holds every
+            # scheduled lane and takes precedence over the daily-only breakers.
+            condition = "runner_transport_failures"
+            reason = (
+                "More than half of the latest 25 scheduled stages lost their callbacks"
+            )
+        elif len(recent) == 25 and len(counted_failures) / 25 > 0.20:
             condition = "terminal_failure_rate"
             reason = "More than 20% of the latest 25 scheduled stages failed"
         if condition and state.paused_at is None:

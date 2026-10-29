@@ -1,4 +1,4 @@
-import { refreshPaperQueries } from "@/lib/queryInvalidation";
+import { invalidatePaperDetails, invalidatePaperFeeds, refreshPaperQueries } from "@/lib/queryInvalidation";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search, X } from "lucide-react";
@@ -40,6 +40,8 @@ export const EditOrganizationsDialog = ({
 }: Props) => {
   const [selected, setSelected] = useState<number[]>(initialOrganizationIds);
   const [searchQuery, setSearchQuery] = useState("");
+  // "Save changes" only saves the checkboxes, so it waits while a suggestion is unsent.
+  const [suggestionUnsent, setSuggestionUnsent] = useState(false);
   const queryClient = useQueryClient();
   const { toast } = useToast();
   useEffect(() => {
@@ -163,13 +165,32 @@ export const EditOrganizationsDialog = ({
           )}
         </div>
         {!organizations.isLoading && displayedOrganizations.length === 0 && searchQuery.trim() && (
-          <SuggestOrganizationForm key={searchQuery.trim()} paperId={paperId} initialName={searchQuery.trim()} />
+          <SuggestOrganizationForm
+            key={searchQuery.trim()}
+            paperId={paperId}
+            initialName={searchQuery.trim()}
+            onApplied={(name) => {
+              // Close first: the refetched paper would otherwise reset this dialog
+              // and show the new organization unchecked, so saving would drop it.
+              onOpenChange(false);
+              toast({ title: "Organization added", description: `Added "${name}" to this paper.` });
+              invalidatePaperDetails(queryClient, [paperId]);
+              invalidatePaperFeeds(queryClient);
+              void queryClient.invalidateQueries({ queryKey: ["organizations"] });
+            }}
+            onUnsentChange={setSuggestionUnsent}
+          />
+        )}
+        {suggestionUnsent && (
+          <p className="text-sm text-muted-foreground">
+            Submit the organization above, or clear the search, before saving.
+          </p>
         )}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={() => save.mutate()} disabled={save.isPending}>
+          <Button onClick={() => save.mutate()} disabled={save.isPending || suggestionUnsent}>
             {submitMode === "pending" ? "Submit test edit" : "Save changes"}
           </Button>
         </DialogFooter>

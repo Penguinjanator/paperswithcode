@@ -405,8 +405,12 @@ a paper-page surface is applied as soon as it is submitted and reviewed
 afterwards: the row is stored as `status = 'approved'`, `reviewed_by_kind =
 'auto'`, and its `catalog_mutation_events` row (`request_id =
 'submission-auto:<id>'`) is attributed to the submitter. Taxonomy suggestions and
-new external papers always stay queued. An edit is held in the queue, with the
-reason in `admin_note`, when it:
+new external papers always stay queued, except a new organization suggested from
+a paper page whose Hugging Face handle resolves to a real HF organization: it is
+created and tagged at once. Approving any organization suggestion with an HF
+handle, automatically or by an admin, takes the canonical handle, website, and
+avatar from the HF profile, overriding submitted ones. An edit is held in the
+queue, with the reason in `admin_note`, when it:
 
 - adds a link to a site that is not trusted (GitHub, Hugging Face, arXiv, X,
   `.edu`/`.ac.*`, `PWC_PAPER_EDIT_AUTO_APPROVE_EXTRA_DOMAINS`, or a host already on
@@ -673,7 +677,7 @@ the active release, apply the protected environment through the same qualified
 path with `--refresh-environment` instead.
 
 The current image probe is recorded at
-`https://huggingface.co/jobs/nielsr/6acf2858c6628814522382f0`; its command
+`https://huggingface.co/jobs/nielsr/6ae241f73fb22a235dd46a82`; its command
 checks the Codex version, PyPDF2 version, full runner SHA-256, exact model, and
 scoped callback-token inheritance. The image is public, so Jobs pull it without
 registry credentials.
@@ -755,8 +759,12 @@ retry, cancel, pause/resume, URL-candidate provenance, proposals, validator
 findings, usage, reports, and private trace URIs. It warns at a three-hour queue
 age and becomes critical at five hours. Scheduled dispatch automatically pauses
 after a server invariant breach, three consecutive trace/apply/verification
-failures, a greater-than-20% non-source failure rate in the latest 25 stages, or
-the post-baseline daily token guardrail. Resuming is an explicit acknowledgement
+failures, a greater-than-20% failure rate in the latest 25 stages, or the
+post-baseline daily token guardrail. Neither failure counter includes
+source-evidence failures or runner transport failures (`Remote runner failed
+(URLError|RemoteDisconnected|TimeoutError|…)`, a callback that never got a
+response), since neither says anything about the curation; more than half of the latest 25
+stages failing that way pauses as `runner_transport_failures` instead. Resuming is an explicit acknowledgement
 that resets the consecutive counters and starts a fresh 25-stage failure-rate
 window; a recurring invariant breach still pauses immediately.
 

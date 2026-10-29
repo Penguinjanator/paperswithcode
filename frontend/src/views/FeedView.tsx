@@ -1,4 +1,5 @@
 import FollowingIntro from "@/components/FollowingIntro";
+import TopicSettings from "@/components/TopicSettings";
 import { useOptionalAuth } from "@/lib/authContext";
 import { researchApi, type FollowKind } from "@/lib/api/research";
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -10,11 +11,9 @@ import { PaperFeedFilters } from "@/components/PaperFeedFilters";
 import { PaperDateFilter } from "@/components/PaperDateFilter";
 import { ArrowUpIcon } from "@/components/chat/icons";
 import ModelPicker from "@/components/chat/ModelPicker";
-import ReasoningEffortPicker from "@/components/chat/ReasoningEffortPicker";
 import { PaperMentionHighlights } from "@/components/chat/PaperMentionHighlights";
 import { PaperMentionPicker } from "@/components/chat/PaperMentionPicker";
 import { usePaperMentions } from "@/components/chat/usePaperMentions";
-import WebSearchToggle from "@/components/chat/WebSearchToggle";
 import { chatApi } from "@/lib/api/chat";
 import { catalogApi } from "@/lib/api/catalog";
 import {
@@ -23,7 +22,7 @@ import {
   isChatMirror,
   isStagingEnvironment,
 } from "@/lib/apiUrl";
-import type { ChatDraft, ReasoningEffort } from "@/lib/chat";
+import type { ChatDraft } from "@/lib/chat";
 import { queueChatLaunch } from "@/lib/chatLaunch";
 import { SUGGESTED_CHAT_PROMPTS, completeSuggestedChatPrompt } from "@/lib/chatPrompts";
 import {
@@ -38,7 +37,7 @@ import { useInfinitePapers } from "@/hooks/usePapers";
 import { useIntersectionObserver } from "@/hooks/useIntersectionObserver";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   readHomepagePaperDateRange,
   withHomepagePaperDateRange,
@@ -144,8 +143,6 @@ export const AskAssistant: React.FC = () => {
   const question = draft.text;
   const [scrollTop, setScrollTop] = useState(0);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_CHAT_MODEL);
-  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   const [launching, setLaunching] = useState(false);
   // Set when the browser blocks the mirror's new tab, so the question survives
   // as a link the visitor can open themselves.
@@ -161,7 +158,6 @@ export const AskAssistant: React.FC = () => {
     retry: false,
     enabled: isChatEnabled(),
   });
-  const webSearchAvailable = Boolean(availabilityQuery.data?.web_search_available);
   const paperMentionsEnabled = isChatEnabled()
     && availabilityQuery.data?.paper_mentions_enabled !== false;
   const mentions = usePaperMentions({
@@ -216,13 +212,9 @@ export const AskAssistant: React.FC = () => {
       return;
     }
     setLaunching(true);
-    queueChatLaunch(nextDraft, selectedModel, {
-      // The chat page gates this on availability, which may still be loading here.
-      webSearchEnabled,
-      reasoningEffort,
-    });
+    queueChatLaunch(nextDraft, selectedModel);
     try {
-      const session = await createSession(selectedModel, reasoningEffort);
+      const session = await createSession(selectedModel);
       navigate(`/chat/${session.id}`);
     } catch {
       // Anonymous users still need the chat route to begin OAuth. Network and
@@ -304,20 +296,6 @@ export const AskAssistant: React.FC = () => {
               selectedModel={selectedModel}
               onModelChange={setSelectedModel}
             />
-            {!mirror && (
-              <ReasoningEffortPicker
-                value={reasoningEffort}
-                onChange={setReasoningEffort}
-                disabled={launching}
-              />
-            )}
-            {webSearchAvailable && (
-              <WebSearchToggle
-                enabled={webSearchEnabled}
-                onChange={setWebSearchEnabled}
-                disabled={launching}
-              />
-            )}
           </div>
           <button
             type="button"
@@ -379,6 +357,14 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     setSearchParams(next);
   };
 
+  const topicFilterHref = (active: boolean) => {
+    const next = new URLSearchParams(searchParams);
+    if (active) next.set("only", "topic");
+    else next.delete("only");
+    const query = next.toString();
+    return query ? `/following?${query}` : "/following";
+  };
+
   const setHasHfArtifacts = (active: boolean) => {
     const next = new URLSearchParams(searchParams);
     if (active) next.set("has_hf_artifacts", "true");
@@ -414,7 +400,8 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     has_hf_artifacts: hasHfArtifacts,
   });
 
-  const followingFilters = { ...dateRange, hasCode, hasHfArtifacts };
+  const topicOnly = following && searchParams.get("only") === "topic";
+  const followingFilters = { ...dateRange, hasCode, hasHfArtifacts, topicOnly };
   const followedFeed = useInfiniteQuery({
     queryKey: ["research-feed", user?.hf_subject, followingFilters],
     queryFn: ({ pageParam }) => researchApi.following(pageParam, followingFilters),
@@ -427,7 +414,23 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     queryFn: researchApi.follows,
     enabled: following && !!user,
   });
-  const noFollows = following && !!user && follows.data?.length === 0;
+  const topic = useQuery({
+    queryKey: ["research-topic", user?.hf_subject],
+    queryFn: researchApi.topic,
+    enabled: following && !!user,
+    refetchInterval: query => query.state.data && ["pending", "running"].includes(query.state.data.status) ? 10000 : false,
+  });
+  const topicBuilding = !!topic.data && ["pending", "running"].includes(topic.data.status);
+  // Refresh the feed once a new topic's backfill finishes.
+  const queryClient = useQueryClient();
+  const wasBuilding = useRef(false);
+  useEffect(() => {
+    if (wasBuilding.current && !topicBuilding) {
+      void queryClient.invalidateQueries({ queryKey: ["research-feed", user?.hf_subject] });
+    }
+    wasBuilding.current = topicBuilding;
+  }, [topicBuilding, queryClient, user?.hf_subject]);
+  const noFollows = following && !!user && follows.data?.length === 0 && topic.isSuccess && !topic.data;
   const followedEntities = useMemo(
     () => following && follows.data
       ? [...follows.data].sort((a, b) => FOLLOW_KIND_ORDER.indexOf(a.kind) - FOLLOW_KIND_ORDER.indexOf(b.kind))
@@ -479,12 +482,29 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
               {follows.isError && (
                 <div style={{ fontSize: 12, color: "var(--ink-faint)" }}>Couldn't load your follows.</div>
               )}
-              {followedEntities.map((follow) => (
-                <Link key={`${follow.kind}-${follow.entity_id}`} to={follow.url} className="sidebar-link sidebar-follow-link">
-                  <span className="sidebar-follow-kind">{FOLLOW_KIND_LABELS[follow.kind]}</span>
-                  <span className="sidebar-follow-name">{follow.name}</span>
-                </Link>
-              ))}
+              <div className="sidebar-links">
+                {topic.data && (
+                  <div className={`sidebar-follow-topic ${topicOnly ? "active" : ""}`}>
+                    <Link
+                      to={topicFilterHref(!topicOnly)}
+                      className="sidebar-link sidebar-follow-link"
+                      title={topicOnly ? "Show papers from everything you follow" : `Show only papers about “${topic.data.text}”`}
+                      aria-current={topicOnly ? "true" : undefined}
+                    >
+                      <span className="sidebar-follow-kind">Topic</span>
+                      <span className="sidebar-follow-name">{topic.data.text}</span>
+                    </Link>
+                    <Link to="/settings#topic" className="sidebar-follow-edit" aria-label="Edit topic">edit</Link>
+                  </div>
+                )}
+                {followedEntities.map((follow) => (
+                  <Link key={`${follow.kind}-${follow.entity_id}`} to={follow.url} className="sidebar-link sidebar-follow-link">
+                    <span className="sidebar-follow-kind">{FOLLOW_KIND_LABELS[follow.kind]}</span>
+                    <span className="sidebar-follow-name">{follow.name}</span>
+                  </Link>
+                ))}
+              </div>
+              <Link to="/settings" className="sidebar-follow-manage">Manage in Settings</Link>
             </div>
           ) : (
             <>
@@ -497,15 +517,17 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                     ))}
                   </div>
                 )}
-                {topTasks.data?.map((task) => (
-                  <Link key={task.id} to={`/tasks/${task.slug}`} className="sidebar-link">
-                    {displayTaskName(task.name, task.slug)}
-                    {task.paper_count != null && <span className="count">{task.paper_count}</span>}
+                <div className="sidebar-links">
+                  {topTasks.data?.map((task) => (
+                    <Link key={task.id} to={`/tasks/${task.slug}`} className="sidebar-link">
+                      {displayTaskName(task.name, task.slug)}
+                      {task.paper_count != null && <span className="count">{task.paper_count}</span>}
+                    </Link>
+                  ))}
+                  <Link to="/tasks" className="sidebar-link sidebar-link-more">
+                    all domains →
                   </Link>
-                ))}
-                <Link to="/tasks" className="sidebar-link" style={{ marginTop: 8, fontStyle: "italic" }}>
-                  all domains →
-                </Link>
+                </div>
               </div>
 
               <div className="sidebar-section sidebar-section-trending-domains">
@@ -522,12 +544,14 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                     No domains gaining momentum right now.
                   </div>
                 )}
-                {trendingTasks.data?.results?.map((task) => (
-                  <Link key={task.id} to={`/tasks/${task.slug}`} className="sidebar-link">
-                    {displayTaskName(task.name, task.slug)}
-                    <span className="count">{task.share_lift.toFixed(1)}x</span>
-                  </Link>
-                ))}
+                <div className="sidebar-links">
+                  {trendingTasks.data?.results?.map((task) => (
+                    <Link key={task.id} to={`/tasks/${task.slug}`} className="sidebar-link">
+                      {displayTaskName(task.name, task.slug)}
+                      <span className="count">{task.share_lift.toFixed(1)}x</span>
+                    </Link>
+                  ))}
+                </div>
               </div>
             </>
           )}
@@ -584,6 +608,23 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
               </Alert>
             )}
 
+            {following && !!user && !noFollows && topic.isSuccess && (!topic.data ? (
+              <section className="following-topic-card" aria-label="Follow a topic">
+                <TopicSettings />
+              </section>
+            ) : topicBuilding ? (
+              <div className="following-topic-note" role="status">
+                Finding papers about “{topic.data.text}”. They appear here as they are found.
+              </div>
+            ) : null)}
+
+            {topicOnly && topic.data && (
+              <div className="following-topic-note following-topic-filter" role="status">
+                Showing only papers about “{topic.data.text}”.{" "}
+                <Link to={topicFilterHref(false)}>Show everything you follow</Link>
+              </div>
+            )}
+
             {following && !auth?.isLoading && !user ? (
               <FollowingIntro signedIn={false} popularTasks={popularTasks} />
             ) : noFollows ? (
@@ -604,7 +645,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                 ))}
               </div>
             ) : cards.length === 0 ? (error ? null :
-              <div className="no-results">{following ? <>No papers from your follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}</div>
+              <div className="no-results">{topicOnly ? <>No papers about your topic match these filters. Widen the date range or <Link to="/settings#topic">edit your topic</Link>.</> : following ? <>No papers from your topic or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}</div>
             ) : (
               <>
                 <div className="paper-list">

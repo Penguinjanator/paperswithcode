@@ -21,6 +21,7 @@ from backend.models.database import (
     AutonomousOperatorState,
     AutonomousRun,
     Paper,
+    PaperCurationBootstrapBundle,
     PaperCurationJob,
     PaperCurationSchedulerState,
 )
@@ -193,6 +194,8 @@ def test_space_image_revision_is_verified_and_mismatch_pauses_daily_dispatch(
 
 
 def test_dispatch_does_not_append_registry_tag_to_verified_space(monkeypatch):
+    from backend.services import codex_add_evals_service as service_module
+
     launched = {}
 
     class Database:
@@ -200,6 +203,9 @@ def test_dispatch_does_not_append_registry_tag_to_verified_space(monkeypatch):
             pass
 
     service = CodexPaperJobService()
+    monkeypatch.setattr(
+        service_module, "_store_bootstrap_bundle", lambda _db, _revision: "b" * 64
+    )
     monkeypatch.setattr(
         service,
         "_verified_job_image",
@@ -241,10 +247,12 @@ def test_dispatch_does_not_append_registry_tag_to_verified_space(monkeypatch):
     assert row.hf_job_id == "hf-job"
 
 
-def test_one_shot_dispatch_calls_only_the_selected_scheduled_row(monkeypatch):
+@pytest.mark.parametrize("trigger", ["hf-daily-cron", "benchmark-gap-cron"])
+def test_one_shot_dispatch_calls_only_the_selected_scheduled_row(monkeypatch, trigger):
     selected = SimpleNamespace(
         id=uuid.uuid4(),
-        trigger="hf-daily-cron",
+        trigger=trigger,
+        kind="add-evals",
         status="queued",
     )
     other = SimpleNamespace(
@@ -303,13 +311,26 @@ def test_one_shot_dispatch_calls_only_the_selected_scheduled_row(monkeypatch):
     assert scheduler.paused_at is not None
 
 
-def test_one_shot_dispatch_refuses_to_exceed_scheduled_capacity(monkeypatch):
+@pytest.mark.parametrize(
+    ("trigger", "active_triggers"),
+    [
+        ("hf-daily-cron", ["hf-trending-cron"]),
+        # The benchmark-gap lane has its own cap, separate from daily work.
+        ("benchmark-gap-cron", ["benchmark-gap-cron", "benchmark-gap-cron"]),
+    ],
+)
+def test_one_shot_dispatch_refuses_to_exceed_scheduled_capacity(
+    monkeypatch, trigger, active_triggers
+):
     selected = SimpleNamespace(
         id=uuid.uuid4(),
-        trigger="hf-daily-cron",
+        trigger=trigger,
+        kind="add-evals",
         status="queued",
     )
-    active = SimpleNamespace(trigger="hf-trending-cron", status="running")
+    active = [
+        SimpleNamespace(trigger=item, status="running") for item in active_triggers
+    ]
     scheduler = SimpleNamespace(
         dispatch_enabled=False,
         paused_at=datetime.now(UTC),
@@ -322,7 +343,7 @@ def test_one_shot_dispatch_refuses_to_exceed_scheduled_capacity(monkeypatch):
             return self
 
         def all(self):
-            return [active]
+            return active
 
     class Database:
         def query(self, _model):
@@ -537,7 +558,9 @@ def test_bootstrap_bundle_is_allowlisted_hashed_and_release_bound(monkeypatch):
     monkeypatch.setattr(service_module, "_git_revision", lambda: revision)
     service = CodexPaperJobService()
 
-    bundle = service.bootstrap_bundle(SimpleNamespace(repository_sha=revision))
+    bundle = service.bootstrap_bundle(
+        SimpleNamespace(repository_sha=revision, bootstrap_bundle_sha256=None)
+    )
 
     assert bundle["revision"] == revision
     assert {item["path"] for item in bundle["files"]} == set(
@@ -547,19 +570,36 @@ def test_bootstrap_bundle_is_allowlisted_hashed_and_release_bound(monkeypatch):
         content = base64.b64decode(item["content_b64"], validate=True)
         assert hashlib.sha256(content).hexdigest() == item["sha256"]
     with pytest.raises(ValueError, match="active immutable release"):
-        service.bootstrap_bundle(SimpleNamespace(repository_sha="e" * 40))
+        service.bootstrap_bundle(
+            SimpleNamespace(repository_sha="e" * 40, bootstrap_bundle_sha256=None)
+        )
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    PaperCurationBootstrapBundle.__table__.create(engine)
+    with Session(engine) as db:
+        key = service_module._store_bootstrap_bundle(db, revision)
+        assert service_module._store_bootstrap_bundle(db, revision) == key
+        assert db.query(PaperCurationBootstrapBundle).count() == 1
+        stored = db.get(PaperCurationBootstrapBundle, key)
+        assert key == service_module._bootstrap_bundle_key(stored.bundle)
+        assert service_module._store_bootstrap_bundle(db, "HEAD") is None
+
+        monkeypatch.setattr(service_module, "_git_revision", lambda: "f" * 40)
+        bound = SimpleNamespace(
+            repository_sha=revision,
+            bootstrap_bundle_sha256=key,
+            stored_bootstrap_bundle=stored,
+        )
+        assert service.bootstrap_bundle(bound) == stored.bundle
+
+        stored.bundle = {**stored.bundle, "files": stored.bundle["files"][1:]}
+        with pytest.raises(ValueError, match="does not match its key"):
+            service.bootstrap_bundle(bound)
+    engine.dispose()
 
     persisted = service_module._curator_bootstrap_bundle(revision)
-    monkeypatch.setattr(service_module, "_git_revision", lambda: "f" * 40)
-    assert (
-        service.bootstrap_bundle(
-            SimpleNamespace(repository_sha=revision, bootstrap_bundle=persisted)
-        )
-        == persisted
-    )
-
     persisted["files"][0]["content_b64"] = base64.b64encode(b"tampered").decode()
     with pytest.raises(ValueError, match="hash mismatch"):
-        service.bootstrap_bundle(
-            SimpleNamespace(repository_sha=revision, bootstrap_bundle=persisted)
+        service_module._validated_bootstrap_bundle(
+            SimpleNamespace(repository_sha=revision), persisted
         )

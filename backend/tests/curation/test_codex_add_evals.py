@@ -121,6 +121,89 @@ def test_curator_bootstrap_allowlist_matches_service_bundle(monkeypatch):
     assert run_paper_curation.BOOTSTRAP_PATHS == set(CURATOR_BOOTSTRAP_PATHS)
 
 
+@pytest.fixture
+def runner_module(monkeypatch):
+    monkeypatch.setenv("PWC_CURATION_API_URL", "https://paperswithcode.co/api/v1")
+    monkeypatch.setenv("PWC_CURATION_JOB_ID", str(uuid.uuid4()))
+    monkeypatch.setenv("PWC_CURATION_JOB_TOKEN", "test-token")
+    monkeypatch.setenv("PWC_CURATION_KIND", "add-evals")
+    monkeypatch.setenv("PWC_GIT_SHA", "a" * 40)
+    module = importlib.import_module("jobs.run_paper_curation")
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    return module
+
+
+def test_runner_retries_a_read_callback_that_lost_its_connection(
+    monkeypatch, runner_module
+):
+    calls = []
+
+    def send(path, payload, method, timeout):
+        calls.append((path, method, timeout))
+        if len(calls) < 3:
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        return {"job": {}}
+
+    monkeypatch.setattr(runner_module, "_send", send)
+
+    assert runner_module.api_request("context") == {"job": {}}
+    assert calls == [("context", "GET", 60)] * 3
+
+
+def test_runner_gives_up_after_four_lost_read_callbacks(monkeypatch, runner_module):
+    calls = []
+
+    def send(*_args):
+        calls.append(1)
+        raise ConnectionResetError
+
+    monkeypatch.setattr(runner_module, "_send", send)
+
+    with pytest.raises(ConnectionResetError):
+        runner_module.api_request("bootstrap")
+    assert len(calls) == 4
+
+
+def test_runner_does_not_retry_a_rejected_callback(monkeypatch, runner_module):
+    calls = []
+
+    def send(*_args):
+        calls.append(1)
+        raise urllib.error.HTTPError("url", 404, "Not found", {}, io.BytesIO())
+
+    monkeypatch.setattr(runner_module, "_send", send)
+
+    with pytest.raises(urllib.error.HTTPError):
+        runner_module.api_request("context")
+    assert len(calls) == 1
+
+
+def test_runner_completion_survives_a_lost_response(monkeypatch, runner_module):
+    calls = []
+
+    def send(path, payload, method, timeout):
+        calls.append((path, method, timeout))
+        if len(calls) == 1:
+            raise runner_module.http.client.RemoteDisconnected("closed")
+        # The first attempt reached the server, so the job is already terminal.
+        raise urllib.error.HTTPError("url", 401, "Invalid", {}, io.BytesIO())
+
+    monkeypatch.setattr(runner_module, "_send", send)
+
+    assert runner_module.complete({"report": "done", "error": None}) == {}
+    assert calls == [("complete", "POST", 300)] * 2
+
+
+def test_runner_completion_401_on_first_attempt_is_an_error(monkeypatch, runner_module):
+    def send(*_args):
+        raise urllib.error.HTTPError("url", 401, "Invalid", {}, io.BytesIO())
+
+    monkeypatch.setattr(runner_module, "_send", send)
+
+    with pytest.raises(urllib.error.HTTPError):
+        runner_module.complete({"report": "", "error": None})
+
+
 def test_launch_error_keeps_hub_validation_message():
     response = Response(
         403,
@@ -324,10 +407,16 @@ def test_unstarted_job_rebinds_to_the_active_bootstrap_release(monkeypatch):
         reasoning_effort="low",
         codex_cli_version="0.74.0",
         validator_version="older-validator",
-        bootstrap_bundle=None,
+        bootstrap_bundle_sha256="a" * 64,
+    )
+    stored = []
+    monkeypatch.setattr(
+        codex_add_evals_service,
+        "_store_bootstrap_bundle",
+        lambda db, revision: stored.append(revision) or "b" * 64,
     )
 
-    CodexPaperJobService._bind_active_release(row, settings)
+    CodexPaperJobService._bind_active_release(object(), row, settings)
 
     assert row.repository_sha == active_revision
     assert row.skill_sha256 != "d" * 64
@@ -336,7 +425,8 @@ def test_unstarted_job_rebinds_to_the_active_bootstrap_release(monkeypatch):
     assert row.reasoning_effort == "medium"
     assert row.codex_cli_version == "0.75.0"
     assert row.validator_version == "scheduled-policy-v1"
-    assert row.bootstrap_bundle["revision"] == active_revision
+    assert stored == [active_revision]
+    assert row.bootstrap_bundle_sha256 == "b" * 64
 
 
 def test_remote_callbacks_identify_the_service_to_cloudflare():

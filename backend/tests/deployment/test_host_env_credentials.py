@@ -13,8 +13,8 @@ import pytest
 import deploy.configure_host_env as configure_host_env
 
 CURATOR_IMAGE = (
-    "cr.hf.co/nielsr/pwc-codex-curator:runner-8fc62f3ce865"
-    "@sha256:93d70eb1c02345d37a099182e322463b47f4480a472720376c1b98068fe075a9"
+    "cr.hf.co/nielsr/pwc-codex-curator:runner-f165a0e4c56a"
+    "@sha256:3c4c6b16737946f69a0390f3c014ffea5a46be8b7e63633e804c21d3e0046496"
 )
 
 
@@ -457,7 +457,7 @@ def test_staging_openai_direct_configuration_is_isolated_and_exact():
         "PWC_OPENAI_API_KEY": "staging-secret",
         "PWC_CHAT_OPENAI_DIRECT_ENABLED": "true",
         "PWC_CHAT_PI_PREWARM_MODEL": "gpt-5.6-luna@openai",
-        "PWC_CHAT_PI_PREWARM_REASONING_EFFORT": "low",
+        "PWC_CHAT_PI_PREWARM_REASONING_EFFORT": "medium",
         "PWC_CHAT_BLANK_POOL_ENABLED": "true",
         "PWC_CHAT_BLANK_POOL_MIN": "1",
         "PWC_CHAT_BLANK_POOL_MAX": "1",
@@ -475,7 +475,7 @@ def test_staging_openai_direct_rollback_restores_legacy_openrouter_profile():
     assert configure_host_env.staging_openai_direct_disable_values() == {
         "PWC_CHAT_OPENAI_DIRECT_ENABLED": "false",
         "PWC_CHAT_PI_PREWARM_MODEL": "openai/gpt-5.6-luna",
-        "PWC_CHAT_PI_PREWARM_REASONING_EFFORT": "low",
+        "PWC_CHAT_PI_PREWARM_REASONING_EFFORT": "medium",
     }
 
 

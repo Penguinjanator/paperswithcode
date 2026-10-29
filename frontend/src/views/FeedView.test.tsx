@@ -9,7 +9,6 @@ import {
   CHAT_DRAFT_KEY,
   CHAT_MODEL_KEY,
   CHAT_REASONING_EFFORT_KEY,
-  CHAT_WEB_SEARCH_KEY,
   readQueuedChatLaunch,
 } from "@/lib/chatLaunch";
 import { chatApi } from "@/lib/api/chat";
@@ -294,52 +293,20 @@ describe("AskAssistant", () => {
         method: "POST",
         body: JSON.stringify({
           selected_model: DEFAULT_CHAT_MODEL,
-          reasoning_effort: "low",
+          reasoning_effort: "medium",
         }),
       }),
     );
     expect(sessionStorage.getItem(CHAT_DRAFT_KEY)).toBe(question);
     expect(sessionStorage.getItem(CHAT_MODEL_KEY)).toBe(DEFAULT_CHAT_MODEL);
     expect(sessionStorage.getItem(CHAT_AUTO_SEND_KEY)).toBe("1");
-    expect(sessionStorage.getItem(CHAT_REASONING_EFFORT_KEY)).toBe("low");
+    expect(sessionStorage.getItem(CHAT_REASONING_EFFORT_KEY)).toBe("medium");
   });
 
-  it("carries the selected reasoning effort into the first chat request", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
-      id: "11111111-1111-4111-8111-111111111111",
-      title: "New chat",
-      selected_model: DEFAULT_CHAT_MODEL,
-      reasoning_effort: "max",
-      created_at: "2026-08-03T00:00:00Z",
-      updated_at: "2026-08-03T00:00:00Z",
-      message_count: 0,
-      is_busy: false,
-      web_search_enabled: false,
-    }), { status: 201, headers: { "Content-Type": "application/json" } }));
-    const user = userEvent.setup();
+  it("does not offer a reasoning effort picker", () => {
     renderAskAssistant();
 
-    await user.click(screen.getByRole("button", { name: "Reasoning effort: Low" }));
-    expect(screen.getByText("Reasoning effort")).toBeVisible();
-    expect(screen.getByRole("option", { name: /Low Faster and more concise/ }))
-      .toHaveAttribute("aria-selected", "true");
-    await user.click(screen.getByRole("option", { name: /Max Deepest and slowest/ }));
-    expect(screen.getByRole("button", { name: "Reasoning effort: Max" }))
-      .toHaveTextContent("Max");
-    await user.type(screen.getByRole("textbox", { name: "Ask the assistant" }), "Deep comparison");
-    await user.click(screen.getByRole("button", { name: "Ask the assistant" }));
-
-    expect(await screen.findByText("Dedicated chat launched")).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining("/api/v1/chat/sessions"),
-      expect.objectContaining({
-        body: JSON.stringify({
-          selected_model: DEFAULT_CHAT_MODEL,
-          reasoning_effort: "max",
-        }),
-      }),
-    );
-    expect(readQueuedChatLaunch()?.reasoningEffort).toBe("max");
+    expect(screen.queryByRole("button", { name: /Reasoning effort/ })).not.toBeInTheDocument();
   });
 
   it("selects an inline paper and carries its structured mention into chat", async () => {
@@ -406,7 +373,7 @@ describe("AskAssistant", () => {
     });
   });
 
-  it("enables available web search by default and carries it into the new chat", async () => {
+  it("launches a new chat from the homepage composer", async () => {
     vi.stubEnv("VITE_CHAT_ENABLED", "1");
     vi.spyOn(chatApi, "getAvailability").mockResolvedValue({
       status: "available",
@@ -428,10 +395,9 @@ describe("AskAssistant", () => {
     const user = userEvent.setup();
     renderAskAssistant();
 
-    const toggle = await screen.findByRole("switch", { name: "Web search" });
-    expect(screen.getByLabelText("Research model"))
+    expect(await screen.findByLabelText("Research model"))
       .toHaveValue("gpt-5.6-luna@openai");
-    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByRole("switch", { name: "Web search" })).not.toBeInTheDocument();
     await user.type(
       screen.getByRole("combobox", { name: "Ask the assistant" }),
       "Find the latest vision-language model release",
@@ -439,22 +405,5 @@ describe("AskAssistant", () => {
     await user.click(screen.getByRole("button", { name: "Ask the assistant" }));
 
     expect(await screen.findByText("Dedicated chat launched")).toBeInTheDocument();
-    expect(sessionStorage.getItem(CHAT_WEB_SEARCH_KEY)).toBe("1");
-  });
-
-  it("hides web search when the feature is unavailable", async () => {
-    vi.stubEnv("VITE_CHAT_ENABLED", "1");
-    const availability = vi.spyOn(chatApi, "getAvailability").mockResolvedValue({
-      status: "available",
-      reason: null,
-      expected_recovery_at: null,
-      paper_mentions_enabled: true,
-      web_search_available: false,
-    });
-    renderAskAssistant();
-
-    await waitFor(() => expect(availability).toHaveBeenCalledTimes(1));
-
-    expect(screen.queryByRole("switch", { name: "Web search" })).not.toBeInTheDocument();
   });
 });

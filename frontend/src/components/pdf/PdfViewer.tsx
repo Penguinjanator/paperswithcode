@@ -14,8 +14,11 @@ import { PdfToolbar } from "./PdfToolbar";
 import type { PdfToolbarResources } from "./PdfToolbar";
 import { createPdfCitationResolver, type PdfBibliographyLink, type PdfCitationResolver } from "./pdfCitationLinks";
 import { PdfBibliographyEntryLink, PdfPaperLink } from "./PdfPaperLink";
+import { PdfAuthorLink, type PdfPaperAuthor } from "./PdfAuthorLink";
+import { pdfAuthorBoxes, type PdfAuthorBox } from "./pdfAuthorLinks";
 import { usePdfPaperLinks } from "./usePdfPaperLinks";
 import { PdfOutline } from "./PdfOutline";
+import { PdfCitationSteps } from "./PdfCitationSteps";
 import { clampZoom, stepZoom } from "./pdfZoom";
 import { activeSectionIndex, loadPdfOutline, pdfSectionFromHash, type PdfOutlineEntry } from "./pdfOutline";
 import type { PdfHighlight, PdfHighlightBox } from "./pdfCitations";
@@ -40,6 +43,8 @@ interface PdfViewerProps {
   chrome?: "reader" | "canvas";
   /** Passage a chat citation points at: scrolled into view and briefly highlighted. */
   highlight?: PdfHighlight;
+  /** The paper's authors; their names on the first page open author cards. */
+  authors?: PdfPaperAuthor[];
 }
 
 // Section jumps leave this much of the previous section visible above the
@@ -134,8 +139,9 @@ function LazyPdfPage({
   highlightBoxes,
   highlightKey,
   highlightBrief,
-  onShowCitation,
+  onShowCitations,
   onShowReference,
+  authors,
 }: {
   page: number;
   width: number;
@@ -147,8 +153,9 @@ function LazyPdfPage({
   highlightBoxes?: number[][];
   highlightKey?: string;
   highlightBrief?: boolean;
-  onShowCitation?: (citation: PdfHighlightBox[]) => void;
+  onShowCitations?: (citations: PdfHighlightBox[][]) => void;
   onShowReference?: (dest: string) => Promise<boolean>;
+  authors?: PdfPaperAuthor[];
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(page <= 2);
@@ -180,6 +187,20 @@ function LazyPdfPage({
   // It replaces the old one only once painted, so zooming never blanks a page.
   const [shownWidth, setShownWidth] = useState(width);
   if (!visible && shownWidth !== width) setShownWidth(width);
+  // Author names are found in the shown text layer each time it renders, and
+  // again when the author list arrives after it.
+  // The callback must keep its identity: react-pdf rebuilds the text layer
+  // whenever it changes.
+  const [textLayerRenders, setTextLayerRenders] = useState(0);
+  const textLayerRendered = useCallback(() => setTextLayerRenders((count) => count + 1), []);
+  const [authorBoxes, setAuthorBoxes] = useState<PdfAuthorBox[]>([]);
+  // Boxes are page fractions, so they stay valid through a zoom until the new
+  // text layer replaces them.
+  useEffect(() => {
+    if (!authors?.length) return setAuthorBoxes([]);
+    const layer = ref.current?.querySelector(".pdf-page-layer:not(.is-pending)");
+    if (layer?.querySelector(".textLayer")) setAuthorBoxes(pdfAuthorBoxes(layer, authors));
+  }, [authors, textLayerRenders]);
   const layerWidths = shownWidth === width ? [width] : [shownWidth, width];
   // A remounted canvas is blank until pdf.js repaints it, so the page's last
   // render stays on top as an image until the fresh canvas has painted.
@@ -252,6 +273,7 @@ function LazyPdfPage({
           onGetAnnotationsSuccess={onAnnotations}
           onRenderSuccess={rendered}
           onRenderError={shown ? undefined : () => setShownWidth(layerWidth)}
+          onRenderTextLayerSuccess={shown && authors ? textLayerRendered : undefined}
           loading={null}
           customTextRenderer={renderSearchText}
         />
@@ -259,7 +281,11 @@ function LazyPdfPage({
     })}
     {snapshot && !painted && <img className="pdf-page-snapshot" src={snapshot} alt="" aria-hidden="true" />}
     {visible && paperLinks.map(link => <PdfPaperLink key={link.anchor.parentElement?.dataset.annotationId} {...link} onShowReference={onShowReference} />)}
-    {visible && resolveCitation && bibliographyLinks.map(link => <PdfBibliographyEntryLink key={link.name} {...link} onShowCitation={onShowCitation} />)}
+    {visible && resolveCitation && bibliographyLinks.map(link => <PdfBibliographyEntryLink key={link.name} {...link} onShowCitations={onShowCitations} />)}
+    {visible && authors && authorBoxes.map(({ authorId, box }) => {
+      const author = authors.find((candidate) => candidate.id === authorId);
+      return author && <PdfAuthorLink key={`${authorId}-${box.join(",")}`} {...author} box={box} />;
+    })}
     {highlightBoxes?.map(([x0, y0, x1, y1], index) => <div
       key={`${highlightKey}-${index}`}
       className={`pdf-citation-highlight${highlightBrief ? " is-brief" : ""}`}
@@ -325,6 +351,7 @@ export function PdfViewer({
   loadErrorMessage,
   chrome = "reader",
   highlight: citedHighlight,
+  authors,
 }: PdfViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -333,7 +360,12 @@ export function PdfViewer({
   // reuse the chat citation highlight, flashed more briefly; whichever was
   // requested last is shown.
   const [citationJump, setCitationJump] = useState<PdfHighlight>();
-  useEffect(() => setCitationJump(undefined), [citedHighlight?.nonce, url]);
+  // The citations of the bibliography entry last jumped from, and which one is shown.
+  const [citationSteps, setCitationSteps] = useState<{ citations: PdfHighlightBox[][]; index: number }>();
+  useEffect(() => {
+    setCitationJump(undefined);
+    setCitationSteps(undefined);
+  }, [citedHighlight?.nonce, url]);
   const highlight = citationJump ?? citedHighlight;
   const highlightKey = highlight && `${citationJump ? "jump" : "cited"}-${highlight.nonce}`;
   // A card jump's short flash waits for the scroll to land, which can cross
@@ -343,6 +375,18 @@ export function PdfViewer({
   const showCitation = useCallback((citation: PdfHighlightBox[]) => {
     setCitationJump((previous) => ({ boxes: citation, nonce: (previous?.nonce ?? 0) + 1 }));
   }, []);
+  const showCitations = useCallback((citations: PdfHighlightBox[][]) => {
+    setCitationSteps({ citations, index: 0 });
+    showCitation(citations[0]);
+  }, [showCitation]);
+  const citationStepsOpen = Boolean(citationSteps && citationSteps.citations.length > 1);
+  const stepCitation = (direction: 1 | -1) => {
+    if (!citationSteps) return;
+    const { citations } = citationSteps;
+    const index = (citationSteps.index + direction + citations.length) % citations.length;
+    setCitationSteps({ citations, index });
+    showCitation(citations[index]);
+  };
   const documentRef = useRef<PDFDocumentProxy | null>(null);
   const textIndex = useRef<PdfTextIndex>();
   const [resolveCitation, setResolveCitation] = useState<PdfCitationResolver>();
@@ -603,6 +647,9 @@ export function PdfViewer({
       } else if (event.key === "Escape" && searchOpen) {
         event.preventDefault();
         closeSearch();
+      } else if (event.key === "Escape" && citationStepsOpen) {
+        event.preventDefault();
+        setCitationSteps(undefined);
       } else if (event.key === "Escape" && !event.repeat && onClose) {
         event.preventDefault();
         onClose();
@@ -610,7 +657,7 @@ export function PdfViewer({
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  }, [closeSearch, onClose, searchOpen]);
+  }, [citationStepsOpen, closeSearch, onClose, searchOpen]);
 
   // Extract the document's text as soon as search opens, so the first query
   // does not wait for every page to be fetched and parsed.
@@ -836,12 +883,19 @@ export function PdfViewer({
             highlightBoxes={shownHighlight?.boxes.filter((box) => box.page === pageNumber).map((box) => box.bbox)}
             highlightKey={highlightKey}
             highlightBrief={Boolean(citationJump)}
-            onShowCitation={showCitation}
+            onShowCitations={showCitations}
             onShowReference={showReference}
+            authors={pageNumber === 1 && chrome === "reader" ? authors : undefined}
           />)}
         </div>
       </Document>}
     </div>
+    {citationSteps && citationStepsOpen && <PdfCitationSteps
+      index={citationSteps.index}
+      count={citationSteps.citations.length}
+      onStep={stepCitation}
+      onClose={() => setCitationSteps(undefined)}
+    />}
     <PdfOutline
       entries={outline}
       activeIndex={navigationSection ?? activeSection}
