@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
 import { Sparkles } from 'lucide-react';
 import { researchApi, TOPIC_MAX_LENGTH, type FollowKind, type ResearchTopic } from '@/lib/api/research';
 import { useAuth } from '@/lib/authContext';
+import { useSaveTopic } from '@/lib/researchTopic';
 
 const KIND_NAMES: Record<FollowKind, string> = {
   task: 'task', method: 'method', benchmark: 'benchmark', author: 'author', organization: 'organization',
@@ -12,14 +13,14 @@ const KIND_NAMES: Record<FollowKind, string> = {
 function topicStatus(topic: ResearchTopic): string {
   if (topic.status === 'failed') return 'We could not finish finding papers for this topic. Save it again to retry.';
   if (topic.status === 'done') return 'Matching papers appear in your Following feed, and new ones are added every hour.';
-  return topic.total ? `Finding matching papers: ${topic.judged.toLocaleString()} of ${topic.total.toLocaleString()} checked…`
-    : 'Finding matching papers…';
+  return topic.total ? `Your feed shows the closest papers now. Refining matches: ${topic.judged.toLocaleString()} of ${topic.total.toLocaleString()} checked…`
+    : 'Your feed shows the closest papers now. Refining matches…';
 }
 
-/** One free-text research topic; Jev decides which papers match it. */
+/** One free-text research topic; Jev decides which papers match it.
+ * On /following, TopicDialog edits the same topic. */
 export default function TopicSettings() {
   const { user } = useAuth();
-  const client = useQueryClient();
   const location = useLocation();
   const input = useRef<HTMLTextAreaElement>(null);
   const queryKey = ['research-topic', user?.hf_subject];
@@ -31,14 +32,7 @@ export default function TopicSettings() {
     refetchInterval: query => query.state.data && ['pending', 'running'].includes(query.state.data.status) ? 5000 : false,
   });
   const [draft, setDraft] = useState<string | null>(null);
-  const save = useMutation({
-    mutationFn: async (text: string | null) => text === null ? (await researchApi.clearTopic(), null) : researchApi.setTopic(text),
-    onSuccess: data => {
-      client.setQueryData(queryKey, data);
-      setDraft(null);
-      void client.invalidateQueries({ queryKey: ['research-feed', user?.hf_subject] });
-    },
-  });
+  const save = useSaveTopic(() => setDraft(null));
   useEffect(() => {
     if (location.hash === '#topic' && topic.isSuccess) {
       input.current?.scrollIntoView({ block: 'center' });
@@ -52,6 +46,9 @@ export default function TopicSettings() {
   // Saving the same text again restarts a backfill that gave up.
   const retry = topic.data?.status === 'failed' && trimmed === saved;
   const savable = trimmed.length >= 3 && (trimmed !== saved || retry);
+  const submit = () => {
+    if (savable && !save.isPending) save.mutate(trimmed);
+  };
   return <div className="research-topic" id="topic">
     <h3 className="research-follow-group-title"><Sparkles aria-hidden="true" />Topic</h3>
     <p className="settings-row-desc">
@@ -63,11 +60,17 @@ export default function TopicSettings() {
       : topic.error ? <p className="settings-token-error" role="alert">Could not load your topic.</p>
       : <form className="research-topic-form" onSubmit={event => {
           event.preventDefault();
-          if (savable) save.mutate(trimmed);
+          submit();
         }}>
-        <textarea ref={input} className="research-topic-input" rows={2} maxLength={TOPIC_MAX_LENGTH}
-          aria-label="Research topic" placeholder="What research do you want to follow?"
-          value={value} onChange={event => setDraft(event.target.value)} />
+        <textarea ref={input} className="research-topic-input" rows={4} maxLength={TOPIC_MAX_LENGTH}
+          aria-label="Research topic" placeholder="e.g. diffusion policies for robot manipulation"
+          value={value} onChange={event => setDraft(event.target.value)}
+          onKeyDown={event => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              submit();
+            }
+          }} />
         <div className="research-topic-actions">
           <span className="research-topic-count">{value.length}/{TOPIC_MAX_LENGTH}</span>
           {saved && <button type="button" className="research-follow-action" disabled={save.isPending}

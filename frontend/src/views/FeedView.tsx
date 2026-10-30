@@ -1,5 +1,7 @@
 import FollowingIntro from "@/components/FollowingIntro";
-import TopicSettings from "@/components/TopicSettings";
+import TopicDialog from "@/components/TopicDialog";
+import { isAuthDisabled } from "@/lib/apiUrl";
+import { clearPendingTopic, readPendingFollows, readPendingTopic, useSaveFollows, useSaveTopic } from "@/lib/researchTopic";
 import { useOptionalAuth } from "@/lib/authContext";
 import { researchApi, type FollowKind } from "@/lib/api/research";
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -7,12 +9,11 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 
 import { PaperCard } from "@/components";
 import { McpShowcase } from "@/components/McpShowcase";
-import { PaperFeedFilters } from "@/components/PaperFeedFilters";
 import { PaperDateFilter } from "@/components/PaperDateFilter";
 import { ArrowUpIcon } from "@/components/chat/icons";
-import ModelPicker from "@/components/chat/ModelPicker";
 import { PaperMentionHighlights } from "@/components/chat/PaperMentionHighlights";
 import { PaperMentionPicker } from "@/components/chat/PaperMentionPicker";
+import { completedScrollHeight, isCompletionKey, useChatCompletion } from "@/components/chat/useChatCompletion";
 import { usePaperMentions } from "@/components/chat/usePaperMentions";
 import { chatApi } from "@/lib/api/chat";
 import { catalogApi } from "@/lib/api/catalog";
@@ -20,17 +21,13 @@ import {
   CANONICAL_CHAT_URL,
   isChatEnabled,
   isChatMirror,
-  isStagingEnvironment,
 } from "@/lib/apiUrl";
 import type { ChatDraft } from "@/lib/chat";
 import { queueChatLaunch } from "@/lib/chatLaunch";
-import { SUGGESTED_CHAT_PROMPTS, completeSuggestedChatPrompt } from "@/lib/chatPrompts";
+import { SUGGESTED_CHAT_PROMPTS } from "@/lib/chatPrompts";
 import {
   createSession,
   DEFAULT_CHAT_MODEL,
-  getChatModels,
-  PRODUCTION_FALLBACK_CHAT_MODELS,
-  STAGING_FALLBACK_CHAT_MODELS,
 } from "@/lib/chatSessions";
 import { displayTaskName, transformPaperForCard } from "@/lib/transform";
 import { useInfinitePapers } from "@/hooks/usePapers";
@@ -42,14 +39,6 @@ import {
   readHomepagePaperDateRange,
   withHomepagePaperDateRange,
 } from "@/lib/paperDateRange";
-
-type OrderBy = "trending" | "date_published" | "citation_count";
-
-const SORT_OPTIONS: Array<[OrderBy, string]> = [
-  ["trending", "trending"],
-  ["date_published", "newest"],
-  ["citation_count", "most cited"],
-];
 
 
 const PLACEHOLDER_TYPE_MS = 45;
@@ -113,44 +102,20 @@ const useRotatingChatPlaceholder = (active: boolean) => {
   return { placeholder, prompt: SUGGESTED_CHAT_PROMPTS[promptIndex] };
 };
 
-const parseOrderBy = (value: string | null): OrderBy => {
-  if (value === "trending" || value === "date_published" || value === "citation_count") {
-    return value;
-  }
-  return "trending";
-};
-
 // Inline "ask the assistant" box between the feed title and the paper list.
 // Submitting hands the question off to the dedicated chat page; on the Space
 // mirror that page lives on the canonical site and opens in a new tab.
 export const AskAssistant: React.FC = () => {
   const navigate = useNavigate();
   const mirror = isChatMirror();
-  const signedIn = Boolean(useOptionalAuth()?.user);
-  // Discovery needs a signed-in user; everyone else sees the fallback list.
-  const modelsQuery = useQuery({
-    queryKey: ["chatModels"],
-    queryFn: getChatModels,
-    retry: false,
-    enabled: isChatEnabled() && signedIn && !mirror,
-  });
-  const models = modelsQuery.data?.items ?? (
-    isStagingEnvironment()
-      ? STAGING_FALLBACK_CHAT_MODELS
-      : PRODUCTION_FALLBACK_CHAT_MODELS
-  );
   const [draft, setDraft] = useState<ChatDraft>({ text: "", paperMentions: [] });
   const question = draft.text;
   const [scrollTop, setScrollTop] = useState(0);
-  const [selectedModel, setSelectedModel] = useState(DEFAULT_CHAT_MODEL);
   const [launching, setLaunching] = useState(false);
   // Set when the browser blocks the mirror's new tab, so the question survives
   // as a link the visitor can open themselves.
   const [blockedHandoffUrl, setBlockedHandoffUrl] = useState<string | null>(null);
   const { placeholder, prompt: placeholderPrompt } = useRotatingChatPlaceholder(!question);
-  // Tab accepts the shown suggestion: the whole prompt in an empty box, or the
-  // rest of a suggestion the visitor has started typing.
-  const completion = question ? completeSuggestedChatPrompt(question) : placeholderPrompt;
   const ref = useRef<HTMLTextAreaElement>(null);
   const availabilityQuery = useQuery({
     queryKey: ["chatAvailability"],
@@ -166,6 +131,10 @@ export const AskAssistant: React.FC = () => {
     enabled: paperMentionsEnabled,
     textareaRef: ref,
   });
+  const typedCompletion = useChatCompletion(draft, mentions.open);
+  // Tab accepts the shown suggestion: the whole prompt in an empty box, or the
+  // rest of what the visitor has started typing.
+  const completion = question ? typedCompletion.completion : placeholderPrompt;
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -174,7 +143,7 @@ export const AskAssistant: React.FC = () => {
     const resize = () => {
       el.style.height = "auto";
       if (question) {
-        el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+        el.style.height = `${Math.min(completedScrollHeight(el), 160)}px`;
         return;
       }
 
@@ -193,13 +162,13 @@ export const AskAssistant: React.FC = () => {
     resize();
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
-  }, [question]);
+  }, [question, completion]);
 
   const submit = async (nextDraft = draft) => {
     const q = nextDraft.text.trim();
     if (!q || launching) return;
     if (mirror) {
-      const params = new URLSearchParams({ q, model: selectedModel });
+      const params = new URLSearchParams({ q, model: DEFAULT_CHAT_MODEL });
       const url = `${CANONICAL_CHAT_URL}?${params}`;
       const tab = window.open(url, "_blank");
       if (!tab) {
@@ -212,9 +181,9 @@ export const AskAssistant: React.FC = () => {
       return;
     }
     setLaunching(true);
-    queueChatLaunch(nextDraft, selectedModel);
+    queueChatLaunch(nextDraft, DEFAULT_CHAT_MODEL);
     try {
-      const session = await createSession(selectedModel);
+      const session = await createSession(DEFAULT_CHAT_MODEL);
       navigate(`/chat/${session.id}`);
     } catch {
       // Anonymous users still need the chat route to begin OAuth. Network and
@@ -231,51 +200,71 @@ export const AskAssistant: React.FC = () => {
         </div>
       )}
       <div className="ask-home">
-        <div className="ask-home-textarea-wrap">
-          <PaperMentionHighlights
-            text={draft.text}
-            mentions={draft.paperMentions}
-            scrollTop={scrollTop}
-            variant="home"
-            completion={question ? completion : ""}
-          />
-          <textarea
-            ref={ref}
-            rows={1}
-            value={question}
-            placeholder={placeholder}
+        <div className="ask-home-row">
+          <div className="ask-home-textarea-wrap">
+            <PaperMentionHighlights
+              text={draft.text}
+              mentions={draft.paperMentions}
+              scrollTop={scrollTop}
+              variant="home"
+              completion={question ? completion : ""}
+            />
+            <textarea
+              ref={ref}
+              rows={1}
+              value={question}
+              placeholder={placeholder}
+              aria-label="Ask the assistant"
+              disabled={launching}
+              onChange={(event) => {
+                mentions.updateText(event.target.value, event.target.selectionStart);
+                typedCompletion.trackCaret(event.target);
+              }}
+              onSelect={(event) => {
+                mentions.refresh(event.currentTarget.selectionStart);
+                typedCompletion.trackCaret(event.currentTarget);
+              }}
+              onClick={(event) => {
+                mentions.refresh(event.currentTarget.selectionStart);
+                typedCompletion.trackCaret(event.currentTarget);
+              }}
+              onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+              onBlur={(event) => {
+                if (!event.relatedTarget?.closest?.(".chat-paper-picker")) window.setTimeout(mentions.close, 0);
+              }}
+              onKeyDown={(event) => {
+                if (mentions.keyDown(event)) return;
+                if (isCompletionKey(event) && completion) {
+                  event.preventDefault();
+                  const text = question + completion;
+                  mentions.updateText(text, text.length);
+                  window.requestAnimationFrame(() => ref.current?.setSelectionRange(text.length, text.length));
+                  return;
+                }
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+              role={paperMentionsEnabled ? "combobox" : undefined}
+              aria-expanded={paperMentionsEnabled ? mentions.open : undefined}
+              aria-controls={mentions.open ? mentions.pickerId : undefined}
+              aria-activedescendant={mentions.open && mentions.results.length
+                ? `${mentions.optionIdPrefix}-${mentions.activeIndex}`
+                : undefined}
+              aria-autocomplete={paperMentionsEnabled ? "list" : undefined}
+              aria-describedby={mentions.message ? "ask-home-paper-mention-message" : undefined}
+            />
+          </div>
+          <button
+            type="button"
+            className={`chat-send${question.trim() ? " chat-send-on" : ""}`}
+            onClick={() => void submit()}
+            disabled={!question.trim() || launching}
             aria-label="Ask the assistant"
-            disabled={launching}
-            onChange={(event) => mentions.updateText(event.target.value, event.target.selectionStart)}
-            onSelect={(event) => mentions.refresh(event.currentTarget.selectionStart)}
-            onClick={(event) => mentions.refresh(event.currentTarget.selectionStart)}
-            onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
-            onBlur={(event) => {
-              if (!event.relatedTarget?.closest?.(".chat-paper-picker")) window.setTimeout(mentions.close, 0);
-            }}
-            onKeyDown={(event) => {
-              if (mentions.keyDown(event)) return;
-              if (event.key === "Tab" && !event.shiftKey && completion) {
-                event.preventDefault();
-                const text = question + completion;
-                mentions.updateText(text, text.length);
-                window.requestAnimationFrame(() => ref.current?.setSelectionRange(text.length, text.length));
-                return;
-              }
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void submit();
-              }
-            }}
-            role={paperMentionsEnabled ? "combobox" : undefined}
-            aria-expanded={paperMentionsEnabled ? mentions.open : undefined}
-            aria-controls={mentions.open ? mentions.pickerId : undefined}
-            aria-activedescendant={mentions.open && mentions.results.length
-              ? `${mentions.optionIdPrefix}-${mentions.activeIndex}`
-              : undefined}
-            aria-autocomplete={paperMentionsEnabled ? "list" : undefined}
-            aria-describedby={mentions.message ? "ask-home-paper-mention-message" : undefined}
-          />
+          >
+            <ArrowUpIcon />
+          </button>
         </div>
         {blockedHandoffUrl && (
           <div className="chat-paper-mention-message" role="alert">
@@ -289,24 +278,6 @@ export const AskAssistant: React.FC = () => {
             {mentions.message}
           </div>
         )}
-        <div className="ask-home-foot">
-          <div className="ask-home-provider-tools">
-            <ModelPicker
-              models={models}
-              selectedModel={selectedModel}
-              onModelChange={setSelectedModel}
-            />
-          </div>
-          <button
-            type="button"
-            className={`chat-send${question.trim() ? " chat-send-on" : ""}`}
-            onClick={() => void submit()}
-            disabled={!question.trim() || launching}
-            aria-label="Ask the assistant"
-          >
-            <ArrowUpIcon />
-          </button>
-        </div>
         <PaperMentionPicker
           open={mentions.open}
           query={mentions.query}
@@ -324,11 +295,11 @@ export const AskAssistant: React.FC = () => {
 };
 
 const FOLLOW_KIND_LABELS: Record<FollowKind, string> = {
-  task: "Task",
-  method: "Method",
-  benchmark: "Benchmark",
-  author: "Author",
-  organization: "Org",
+  task: "Tasks",
+  method: "Methods",
+  benchmark: "Benchmarks",
+  author: "Authors",
+  organization: "Orgs",
 };
 const FOLLOW_KIND_ORDER = Object.keys(FOLLOW_KIND_LABELS) as FollowKind[];
 
@@ -337,24 +308,17 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   const auth = useOptionalAuth();
   const user = auth?.user;
   const [searchParams, setSearchParams] = useSearchParams();
-  const orderBy = parseOrderBy(searchParams.get("order_by"));
   // Following defaults to its 30-day match window; the other tabs default to a week.
   const dateRange = readHomepagePaperDateRange(searchParams, undefined, following ? "month" : "week");
-  const hasCode = searchParams.get("has_code") === "true";
-  const hasHfArtifacts = searchParams.get("has_hf_artifacts") === "true";
 
-  const setOrderBy = (nextOrderBy: OrderBy) => {
+  // The home feed only offers trending and following; newest and most cited
+  // stay on the other paper feeds.
+  const showTrending = () => {
     const next = new URLSearchParams(searchParams);
-    next.set("order_by", nextOrderBy);
-    if (following) navigate(`/?${next}`);
-    else setSearchParams(next);
-  };
-
-  const setHasCode = (active: boolean) => {
-    const next = new URLSearchParams(searchParams);
-    if (active) next.set("has_code", "true");
-    else next.delete("has_code");
-    setSearchParams(next);
+    next.delete("order_by");
+    next.delete("only");
+    const query = next.toString();
+    navigate(query ? `/?${query}` : "/");
   };
 
   const topicFilterHref = (active: boolean) => {
@@ -363,13 +327,6 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     else next.delete("only");
     const query = next.toString();
     return query ? `/following?${query}` : "/following";
-  };
-
-  const setHasHfArtifacts = (active: boolean) => {
-    const next = new URLSearchParams(searchParams);
-    if (active) next.set("has_hf_artifacts", "true");
-    else next.delete("has_hf_artifacts");
-    setSearchParams(next);
   };
 
   // Sidebar: top tasks by paper count.
@@ -391,17 +348,15 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   const publicFeed = useInfinitePapers({
     enabled: !following,
     page_size: 30,
-    order_by: orderBy,
+    order_by: "trending",
     order_dir: "desc",
     start_date: dateRange.startDate,
     end_date: dateRange.endDate,
     include_resources: true,
-    has_code: hasCode,
-    has_hf_artifacts: hasHfArtifacts,
   });
 
   const topicOnly = following && searchParams.get("only") === "topic";
-  const followingFilters = { ...dateRange, hasCode, hasHfArtifacts, topicOnly };
+  const followingFilters = { ...dateRange, topicOnly };
   const followedFeed = useInfiniteQuery({
     queryKey: ["research-feed", user?.hf_subject, followingFilters],
     queryFn: ({ pageParam }) => researchApi.following(pageParam, followingFilters),
@@ -421,6 +376,8 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     refetchInterval: query => query.state.data && ["pending", "running"].includes(query.state.data.status) ? 10000 : false,
   });
   const topicBuilding = !!topic.data && ["pending", "running"].includes(topic.data.status);
+  const topicName = topic.data ? topic.data.label ?? topic.data.text : "";
+  const [editingTopic, setEditingTopic] = useState(false);
   // Refresh the feed once a new topic's backfill finishes.
   const queryClient = useQueryClient();
   const wasBuilding = useRef(false);
@@ -431,15 +388,48 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     wasBuilding.current = topicBuilding;
   }, [topicBuilding, queryClient, user?.hf_subject]);
   const noFollows = following && !!user && follows.data?.length === 0 && topic.isSuccess && !topic.data;
-  const followedEntities = useMemo(
-    () => following && follows.data
-      ? [...follows.data].sort((a, b) => FOLLOW_KIND_ORDER.indexOf(a.kind) - FOLLOW_KIND_ORDER.indexOf(b.kind))
-      : [],
+  const showIntro = (following && !auth?.isLoading && !user) || noFollows;
+  const canBuildFeed = !!user || !isAuthDisabled();
+  // The pop-up opens on its own only when the intro first shows to a visitor who arrived without follows:
+  // not after a removal, and not while saving what a guest picked before signing in, which may finish
+  // before follows reload. It lives here rather than in the intro so it stays open once the first save lands.
+  const [hadFollows, setHadFollows] = useState(false);
+  const [restoringPicks] = useState(() => !!readPendingTopic() || readPendingFollows().length > 0);
+  const [introShown, setIntroShown] = useState(false);
+  if (!hadFollows && (!!topic.data || !!follows.data?.length)) setHadFollows(true);
+  if (showIntro && !introShown) {
+    setIntroShown(true);
+    if (canBuildFeed && !hadFollows && !restoringPicks) setEditingTopic(true);
+  }
+  // Save the topic a guest submitted before signing in; it stays stashed until the save succeeds.
+  const pendingSave = useSaveTopic();
+  const { mutate: savePendingTopic } = pendingSave;
+  const pendingStarted = useRef(false);
+  useEffect(() => {
+    const pending = readPendingTopic();
+    if (!user || !topic.isSuccess || !pending || pendingStarted.current) return;
+    pendingStarted.current = true;
+    if (pending === topic.data?.text) clearPendingTopic();
+    else savePendingTopic(pending);
+  }, [user, topic.isSuccess, topic.data, savePendingTopic]);
+  // Likewise follow the tasks and methods a guest picked in the pop-up before signing in.
+  const pendingFollows = useSaveFollows();
+  const { mutate: savePendingFollows } = pendingFollows;
+  const pendingFollowsStarted = useRef(false);
+  useEffect(() => {
+    const picks = readPendingFollows();
+    if (!user || !picks.length || pendingFollowsStarted.current) return;
+    pendingFollowsStarted.current = true;
+    savePendingFollows(picks);
+  }, [user, savePendingFollows]);
+  const followGroups = useMemo(
+    () => FOLLOW_KIND_ORDER
+      .map(kind => ({ kind, follows: following ? follows.data?.filter(follow => follow.kind === kind) ?? [] : [] }))
+      .filter(group => group.follows.length > 0),
     [following, follows.data],
   );
   // Keep the follows section up while auth or follows load so the domain lists never flash in.
   const showFollowsSidebar = following && (!!auth?.isLoading || (!!user && !noFollows));
-  const popularTasks = topTasks.data?.slice(0, 8);
   const infinite = following ? followedFeed : publicFeed;
   const cards = useMemo(() => following
     ? followedFeed.data?.pages.flatMap(page => page.map(entry => ({ ...transformPaperForCard(entry.paper), followReasons: entry.reasons }))) ?? []
@@ -468,7 +458,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
       </div>
 
       <div className="layout-with-sidebar">
-        <aside className="sidebar">
+        <aside className="sidebar feed-sidebar">
           {showFollowsSidebar ? (
             <div className="sidebar-section sidebar-section-follows">
               <div className="sidebar-label">You follow</div>
@@ -492,16 +482,21 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                       aria-current={topicOnly ? "true" : undefined}
                     >
                       <span className="sidebar-follow-kind">Topic</span>
-                      <span className="sidebar-follow-name">{topic.data.text}</span>
+                      <span className="sidebar-follow-name">{topicName}</span>
                     </Link>
-                    <Link to="/settings#topic" className="sidebar-follow-edit" aria-label="Edit topic">edit</Link>
+                    <button type="button" className="sidebar-follow-edit" aria-label="Edit topic"
+                      aria-expanded={editingTopic} onClick={() => setEditingTopic(true)}>edit</button>
                   </div>
                 )}
-                {followedEntities.map((follow) => (
-                  <Link key={`${follow.kind}-${follow.entity_id}`} to={follow.url} className="sidebar-link sidebar-follow-link">
-                    <span className="sidebar-follow-kind">{FOLLOW_KIND_LABELS[follow.kind]}</span>
-                    <span className="sidebar-follow-name">{follow.name}</span>
-                  </Link>
+                {followGroups.map((group) => (
+                  <div key={group.kind} className="sidebar-follow-group">
+                    <span className="sidebar-follow-kind">{FOLLOW_KIND_LABELS[group.kind]}</span>
+                    {group.follows.map((follow) => (
+                      <Link key={follow.entity_id} to={follow.url} className="sidebar-link sidebar-follow-link">
+                        <span className="sidebar-follow-name">{follow.name}</span>
+                      </Link>
+                    ))}
+                  </div>
                 ))}
               </div>
               <Link to="/settings" className="sidebar-follow-manage">Manage in Settings</Link>
@@ -570,15 +565,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
             <div className="sort-bar home-feed-sort-bar">
               <div className="paper-feed-toolbar-controls">
                 <div className="sort-options">
-                  {SORT_OPTIONS.map(([k, l]) => (
-                    <button
-                      key={k}
-                      className={`sort-btn ${!following && orderBy === k ? "active" : ""}`}
-                      onClick={() => setOrderBy(k)}
-                    >
-                      {l}
-                    </button>
-                  ))}
+                  <button className={`sort-btn ${following ? "" : "active"}`} onClick={showTrending}>trending</button>
                   <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => {
                     const next = new URLSearchParams(searchParams);
                     next.delete("order_by");
@@ -586,12 +573,6 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                     navigate(query ? `/following?${query}` : "/following");
                   }}>following</button>
                 </div>
-                <PaperFeedFilters
-                  hasCode={hasCode}
-                  hasHfArtifacts={hasHfArtifacts}
-                  onHasCodeChange={setHasCode}
-                  onHasHfArtifactsChange={setHasHfArtifacts}
-                />
               </div>
               <PaperDateFilter
                 startDate={dateRange.startDate}
@@ -608,27 +589,44 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
               </Alert>
             )}
 
-            {following && !!user && !noFollows && topic.isSuccess && (!topic.data ? (
-              <section className="following-topic-card" aria-label="Follow a topic">
-                <TopicSettings />
-              </section>
+            {pendingSave.isError && pendingSave.variables && (
+              <Alert variant="destructive" className="mb-4">
+                <AlertDescription>
+                  Could not follow “{pendingSave.variables}”. <button type="button" onClick={() => savePendingTopic(pendingSave.variables)}>Try again</button>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {pendingFollows.isError && pendingFollows.variables && (
+              <Alert variant="destructive" className="mb-4">
+                <AlertDescription>
+                  Could not follow {pendingFollows.variables.map(pick => pick.name).join(", ")}. <button type="button" onClick={() => savePendingFollows(pendingFollows.variables)}>Try again</button>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {following && !!user && topic.isSuccess && !follows.isPending && !noFollows && (!topic.data ? (
+              <div className="following-topic-note" role="status">
+                Describe a topic in your own words, and a model adds matching new papers to this feed.{" "}
+                <button type="button" className="link-button" onClick={() => setEditingTopic(true)}>Follow a topic</button>
+              </div>
             ) : topicBuilding ? (
               <div className="following-topic-note" role="status">
-                Finding papers about “{topic.data.text}”. They appear here as they are found.
+                Showing the closest papers about “{topicName}” now. A model is reading papers to refine these matches, which takes a few minutes.
               </div>
             ) : null)}
 
+            {following && canBuildFeed && <TopicDialog open={editingTopic} onOpenChange={setEditingTopic} />}
+
             {topicOnly && topic.data && (
               <div className="following-topic-note following-topic-filter" role="status">
-                Showing only papers about “{topic.data.text}”.{" "}
+                Showing only papers about “{topicName}”.{" "}
                 <Link to={topicFilterHref(false)}>Show everything you follow</Link>
               </div>
             )}
 
-            {following && !auth?.isLoading && !user ? (
-              <FollowingIntro signedIn={false} popularTasks={popularTasks} />
-            ) : noFollows ? (
-              <FollowingIntro signedIn popularTasks={popularTasks} />
+            {showIntro ? (
+              <FollowingIntro onBuild={canBuildFeed ? () => setEditingTopic(true) : undefined} />
             ) : isLoading ? (
               <div className="paper-list">
                 {Array.from({ length: 6 }).map((_, i) => (
@@ -645,7 +643,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
                 ))}
               </div>
             ) : cards.length === 0 ? (error ? null :
-              <div className="no-results">{topicOnly ? <>No papers about your topic match these filters. Widen the date range or <Link to="/settings#topic">edit your topic</Link>.</> : following ? <>No papers from your topic or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}</div>
+              <div className="no-results">{topicOnly ? <>No papers about your topic match these filters. Widen the date range or <button type="button" className="link-button" onClick={() => setEditingTopic(true)}>edit your topic</button>.</> : following ? <>No papers from your topic or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}</div>
             ) : (
               <>
                 <div className="paper-list">
