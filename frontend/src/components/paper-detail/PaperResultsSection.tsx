@@ -1,16 +1,16 @@
 import { Link } from "react-router-dom";
 
-import { Icon } from "@/components";
+import { Icon } from "@/components/Icon";
 import ClosedSourceEvalBadge from "@/components/ClosedSourceEvalBadge";
 import ExternalSourceEvalBadge from "@/components/ExternalSourceEvalBadge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { resultsTaskAnchorId, resultsTaskHash } from "@/hooks/usePaperDetailPageModel";
 import type { Evaluation } from "@/lib/api/evaluations.types";
 import type { Paper } from "@/lib/api/papers.types";
-import { isCodexAddEvalsEnabled } from "@/lib/codexAddEvals";
+import { isCodexAddEvalsEnabled } from "@/lib/apiUrl";
 import { formatMetricValue } from "@/lib/utils";
 
-import { CodexAddEvalsDialog } from "./CodexAddEvalsDialog";
+import { CodexPaperJobDialog } from "./CodexPaperJobDialog";
 import { PaperSectionRule } from "./PaperSectionRule";
 
 export interface EvaluationTaskGroup {
@@ -62,7 +62,9 @@ export function PaperResultsSection({
               </button>
             )}
             {isAdmin && isCodexAddEvalsEnabled() && (
-              <CodexAddEvalsDialog
+              <CodexPaperJobDialog
+                kind="add-evals"
+                triggerClassName="edit-link"
                 paperId={Number(paper.id)}
                 paperTitle={paper.title}
                 onComplete={onRefresh}

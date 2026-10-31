@@ -3,22 +3,22 @@ import { paperQueryKeys } from "@/lib/paperQueryKeys";
 import { invalidatePaperDetails, invalidatePaperFeeds } from "@/lib/queryInvalidation";
 import React from "react";
 import "./SubmissionsDashboard.css";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
   Inbox,
   Undo2,
   Loader2,
   RefreshCw,
-  ShieldAlert,
   XCircle,
 } from "lucide-react";
 
 import PendingEditDiff from "@/components/submissions/PendingEditDiff";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useToast } from "@/hooks/use-toast";
-import { useAuth } from "@/lib/authContext";
+import { getApiErrorMessage } from "@/lib/apiTransport";
 import {
+  EDIT_TYPE_META,
   type PendingEditStatus,
   type PendingEditType,
   type PendingPaperEdit,
@@ -28,34 +28,12 @@ import type { Paper } from "@/lib/api/papers.types";
 import { catalogApi } from "@/lib/api/catalog";
 import { submissionsApi } from "@/lib/api/submissions";
 import { cn } from "@/lib/utils";
+import { submissionQueryKeys } from "@/lib/api/queryKeys";
 
 const PAGE_SIZE = 25;
 const STATUS_FILTERS: Array<PendingEditStatus | "all"> = ["pending", "approved", "rejected", "all"];
-const EDIT_TYPE_FILTERS: Array<PendingEditType | "all"> = [
-  "all",
-  "tasks",
-  "methods",
-  "evaluations",
-  "repositories",
-  "project_pages",
-  "source_url",
-  "x_threads",
-  "new_task",
-  "new_method",
-  "new_benchmark",
-  "new_metric",
-  "new_conference",
-  "new_organization",
-  "new_external_paper",
-];
+const EDIT_TYPE_FILTERS = ["all", ...Object.keys(EDIT_TYPE_META)] as Array<PendingEditType | "all">;
 const COUNT_STATUSES: PendingEditStatus[] = ["pending", "approved", "rejected"];
-const ADMINISTRATIVE_SUGGESTION_TYPES = new Set<PendingEditType>([
-  "new_task",
-  "new_method",
-  "new_benchmark",
-  "new_metric",
-  "new_conference",
-]);
 
 interface ListData {
   count: number;
@@ -69,22 +47,6 @@ function initialsFor(username: string): string {
 function formatLabel(value: string): string {
   return value.replace(/_/g, " ");
 }
-
-function formatEditTypeFilterLabel(value: PendingEditType | "all"): string {
-  return value === "new_external_paper" ? "external paper" : formatLabel(value);
-}
-
-const DIRECTORY_SUGGESTION_LABELS: Partial<
-  Record<PendingEditType, { title: string; subtitle: string }>
-> = {
-  new_task: { title: "New task", subtitle: "Task suggestion" },
-  new_method: { title: "New method", subtitle: "Method suggestion" },
-  new_benchmark: { title: "New benchmark", subtitle: "Benchmark suggestion" },
-  new_metric: { title: "New metric", subtitle: "Metric suggestion" },
-  new_conference: { title: "New conference", subtitle: "Conference suggestion" },
-  new_organization: { title: "New organization", subtitle: "Organization suggestion" },
-  new_external_paper: { title: "External paper", subtitle: "External paper submission" },
-};
 
 function formatRelativeTime(value: string | null | undefined): string {
   if (!value) return "unknown time";
@@ -103,20 +65,6 @@ function formatRelativeTime(value: string | null | undefined): string {
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function errorDescription(error: unknown, fallback: string): string {
-  const err = error as { response?: string; message?: string };
-  if (err.response) {
-    try {
-      const parsed = JSON.parse(err.response);
-      if (typeof parsed?.detail === "string") return parsed.detail;
-      if (Array.isArray(parsed?.detail) && parsed.detail[0]?.msg) return parsed.detail[0].msg;
-    } catch {
-      return err.response;
-    }
-  }
-  return err.message || fallback;
-}
-
 function statusClass(status: PendingEditStatus): string {
   if (status === "approved") return "approved";
   if (status === "rejected") return "rejected";
@@ -131,63 +79,42 @@ function sortByCreatedDesc(rows: PendingPaperEdit[]): PendingPaperEdit[] {
   return [...rows].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 }
 
-async function fetchSubmissions(
-  status: PendingEditStatus | "all",
-  editType: PendingEditType | "all",
-  visibleLimit: number,
-  autoOnly: boolean,
-): Promise<ListData> {
-  const edit_type = editType === "all" ? undefined : editType;
-  const reviewed_by_kind = autoOnly ? "auto" : undefined;
-  if (status !== "all") {
-    return submissionsApi.list({
-      status,
-      edit_type,
-      reviewed_by_kind,
-      limit: visibleLimit,
-      offset: 0,
-    });
-  }
+type StatusOffsets = Partial<Record<PendingEditStatus, number>>;
 
-  const pages = await Promise.all(
-    COUNT_STATUSES.map((itemStatus) =>
+interface SubmissionPage extends ListData {
+  nextOffsets: StatusOffsets | null;
+}
+
+// One page of the newest submissions across `statuses`. Each status list is
+// sorted newest first, so merging the next PAGE_SIZE rows of every list and
+// keeping the newest PAGE_SIZE gives the exact next page; each status offset
+// advances only by the rows it contributed.
+async function fetchSubmissionPage(
+  statuses: PendingEditStatus[],
+  editType: PendingEditType | "all",
+  autoOnly: boolean,
+  offsets: StatusOffsets,
+): Promise<SubmissionPage> {
+  const lists = await Promise.all(
+    statuses.map((status) =>
       submissionsApi.list({
-        status: itemStatus,
-        edit_type,
-        reviewed_by_kind,
-        limit: visibleLimit,
-        offset: 0,
+        status,
+        edit_type: editType === "all" ? undefined : editType,
+        reviewed_by_kind: autoOnly ? "auto" : undefined,
+        limit: PAGE_SIZE,
+        offset: offsets[status] ?? 0,
       }),
     ),
   );
-
-  return {
-    count: pages.reduce((sum, page) => sum + page.count, 0),
-    results: sortByCreatedDesc(pages.flatMap((page) => page.results)).slice(0, visibleLimit),
-  };
-}
-
-function AdminPlaceholder() {
-  return (
-    <div className="page">
-      <div className="submission-empty submission-empty-warn">
-        <ShieldAlert size={22} />
-        <h1>Admin access required</h1>
-        <p>Sign in with an allowlisted Hugging Face admin account to review paper edit submissions.</p>
-      </div>
-    </div>
-  );
-}
-
-function LoadingPlaceholder() {
-  return (
-    <div className="page">
-      <div className="submission-loading">
-        <Loader2 className="spin" size={18} />
-        <span>Checking admin session...</span>
-      </div>
-    </div>
-  );
+  const results = sortByCreatedDesc(lists.flatMap((list) => list.results)).slice(0, PAGE_SIZE);
+  const nextOffsets: StatusOffsets = {};
+  statuses.forEach((status, index) => {
+    const taken = results.filter((row) => lists[index].results.includes(row)).length;
+    nextOffsets[status] = (offsets[status] ?? 0) + taken;
+  });
+  const count = lists.reduce((sum, list) => sum + list.count, 0);
+  const loaded = statuses.reduce((sum, status) => sum + (nextOffsets[status] ?? 0), 0);
+  return { count, results, nextOffsets: results.length > 0 && loaded < count ? nextOffsets : null };
 }
 
 function SubmissionCard({
@@ -201,10 +128,8 @@ function SubmissionCard({
   const { toast } = useToast();
   const paperId = submission.paper_id;
   const isDirectorySuggestion = paperId === null;
-  const isAdministrativeSuggestion = ADMINISTRATIVE_SUGGESTION_TYPES.has(
-    submission.edit_type,
-  );
-  const directoryLabels = DIRECTORY_SUGGESTION_LABELS[submission.edit_type] ?? {
+  const isAdministrativeSuggestion = EDIT_TYPE_META[submission.edit_type].administrative;
+  const directoryLabels = EDIT_TYPE_META[submission.edit_type].directory ?? {
     title: "Taxonomy directory",
     subtitle: "Directory suggestion",
   };
@@ -222,8 +147,7 @@ function SubmissionCard({
 
   const invalidateAfterReview = React.useCallback(
     (reviewed: PendingPaperEdit) => {
-      queryClient.invalidateQueries({ queryKey: ["pendingPaperEdits"] });
-      queryClient.invalidateQueries({ queryKey: ["pendingPaperEdit", reviewed.id] });
+      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
       if (reviewed.paper_id != null && reviewed.edit_type !== "evaluations") {
         invalidatePaperDetails(queryClient, [String(reviewed.paper_id), paper?.arxiv_id]);
       }
@@ -239,11 +163,7 @@ function SubmissionCard({
         refreshEvaluationQueries(queryClient, evaluationChange(
           String(reviewed.paper_id),
           reviewed.current_payload?.evaluations ?? [],
-          reviewed.proposed_payload.operations.map(operation => operation.op === "create"
-            ? { kind: "create", data: operation.data }
-            : operation.op === "update"
-              ? { kind: "update", evaluationId: operation.evaluation_id, data: operation.data }
-              : { kind: "delete", evaluationId: operation.evaluation_id }),
+          reviewed.proposed_payload.operations,
           paper?.arxiv_id ?? undefined,
         ));
       } else if (reviewed.paper_id != null && !isAdministrativeSuggestion) {
@@ -259,7 +179,7 @@ function SubmissionCard({
     onError: (error) => {
       toast({
         title: "Could not approve submission",
-        description: errorDescription(error, "Approval failed. Please try again."),
+        description: getApiErrorMessage(error, "Approval failed. Please try again."),
         variant: "destructive",
       });
     },
@@ -277,7 +197,7 @@ function SubmissionCard({
     onError: (error) => {
       toast({
         title: "Could not reject submission",
-        description: errorDescription(error, "Rejection failed. Please try again."),
+        description: getApiErrorMessage(error, "Rejection failed. Please try again."),
         variant: "destructive",
       });
     },
@@ -286,7 +206,7 @@ function SubmissionCard({
   const revertMutation = useMutation<unknown, unknown, void>({
     mutationFn: () => catalogApi.rollbackEvent(submission.catalog_event_id as string),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["pendingPaperEdits"] });
+      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
       if (submission.paper_id != null) {
         invalidatePaperDetails(queryClient, [String(submission.paper_id), paper?.arxiv_id]);
         invalidatePaperFeeds(queryClient);
@@ -296,7 +216,7 @@ function SubmissionCard({
     onError: (error) => {
       toast({
         title: "Could not revert edit",
-        description: errorDescription(error, "The paper changed after this edit, or it was already reverted."),
+        description: getApiErrorMessage(error, "The paper changed after this edit, or it was already reverted."),
         variant: "destructive",
       });
     },
@@ -310,7 +230,7 @@ function SubmissionCard({
     mutationFn: (suspend) =>
       submissionsApi.revertAutoApproved(submission.hf_subject as string, { suspend }),
     onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ["pendingPaperEdits"] });
+      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
       invalidatePaperFeeds(queryClient);
       toast({
         title: `Reverted ${result.reverted} edits by @${submission.hf_username}`,
@@ -322,7 +242,7 @@ function SubmissionCard({
     onError: (error) => {
       toast({
         title: "Could not revert edits",
-        description: errorDescription(error, "Bulk revert failed. Please try again."),
+        description: getApiErrorMessage(error, "Bulk revert failed. Please try again."),
         variant: "destructive",
       });
     },
@@ -497,20 +417,13 @@ function SubmissionCard({
 }
 
 export default function SubmissionsDashboard() {
-  const { user, isLoading: authLoading } = useAuth();
   const { toast } = useToast();
   const [status, setStatus] = React.useState<PendingEditStatus | "all">("pending");
   const [editType, setEditType] = React.useState<PendingEditType | "all">("all");
   const [autoOnly, setAutoOnly] = React.useState(false);
-  const [visibleLimit, setVisibleLimit] = React.useState(PAGE_SIZE);
-  const isAdmin = !!user?.is_admin;
-
-  React.useEffect(() => {
-    setVisibleLimit(PAGE_SIZE);
-  }, [status, editType, autoOnly]);
 
   const countsQuery = useQuery({
-    queryKey: ["pendingPaperEdits", "counts", editType, autoOnly],
+    queryKey: [...submissionQueryKeys.pendingEdits, "counts", editType, autoOnly],
     queryFn: async () => {
       const edit_type = editType === "all" ? undefined : editType;
       const pages = await Promise.all(
@@ -528,35 +441,39 @@ export default function SubmissionsDashboard() {
         pages.map((page, index) => [COUNT_STATUSES[index], page.count]),
       ) as Record<PendingEditStatus, number>;
     },
-    enabled: isAdmin,
     staleTime: 30 * 1000,
   });
 
-  const listQuery = useQuery({
-    queryKey: ["pendingPaperEdits", { status, editType, visibleLimit, autoOnly }],
-    queryFn: () => fetchSubmissions(status, editType, visibleLimit, autoOnly),
-    enabled: isAdmin,
+  const listQuery = useInfiniteQuery({
+    queryKey: [...submissionQueryKeys.pendingEdits, { status, editType, autoOnly }],
+    queryFn: ({ pageParam }) =>
+      fetchSubmissionPage(status === "all" ? COUNT_STATUSES : [status], editType, autoOnly, pageParam),
+    initialPageParam: {} as StatusOffsets,
+    getNextPageParam: (page) => page.nextOffsets ?? undefined,
     retry: false,
   });
+  const submissions = React.useMemo(
+    () => listQuery.data?.pages.flatMap((page) => page.results) ?? [],
+    [listQuery.data],
+  );
 
   const paperIds = React.useMemo(
     () =>
       Array.from(
         new Set(
-          (listQuery.data?.results ?? [])
+          submissions
             .map((row) => row.paper_id)
             .filter((paperId): paperId is number => paperId != null),
         ),
       ).sort((a, b) => a - b),
-    [listQuery.data?.results],
+    [submissions],
   );
 
   const paperQueries = useQueries({
     queries: paperIds.map((paperId) => ({
       queryKey: paperQueryKeys.summary(String(paperId)),
       queryFn: () => papersApi.get(String(paperId), false),
-      enabled: isAdmin,
-      staleTime: 5 * 60 * 1000,
+        staleTime: 5 * 60 * 1000,
     })),
   });
 
@@ -575,13 +492,10 @@ export default function SubmissionsDashboard() {
     if (!listQuery.error) return;
     toast({
       title: "Could not load submissions",
-      description: errorDescription(listQuery.error, "Failed to load pending paper edits."),
+      description: getApiErrorMessage(listQuery.error, "Failed to load pending paper edits."),
       variant: "destructive",
     });
   }, [listQuery.error, toast]);
-
-  if (authLoading) return <LoadingPlaceholder />;
-  if (!isAdmin) return <AdminPlaceholder />;
 
   const counts = countsQuery.data;
   const allCount = counts ? counts.pending + counts.approved + counts.rejected : undefined;
@@ -591,9 +505,7 @@ export default function SubmissionsDashboard() {
     rejected: counts?.rejected,
     all: allCount,
   };
-  const submissions = listQuery.data?.results ?? [];
-  const totalCount = listQuery.data?.count ?? 0;
-  const hasMore = submissions.length < totalCount;
+  const totalCount = listQuery.data?.pages[0]?.count ?? 0;
 
   return (
     <div className="page submissions-page">
@@ -657,7 +569,7 @@ export default function SubmissionsDashboard() {
                 className={cn("sort-btn", editType === item && "active")}
                 onClick={() => setEditType(item)}
               >
-                {formatEditTypeFilterLabel(item)}
+                {item === "all" ? "all" : EDIT_TYPE_META[item].label}
               </button>
             ))}
           </div>
@@ -683,7 +595,7 @@ export default function SubmissionsDashboard() {
           <div className="submission-empty submission-empty-warn" role="alert">
             <Inbox size={28} />
             <h2>Could not display submissions.</h2>
-            <p>{errorDescription(listQuery.error, "The submissions response was invalid.")}</p>
+            <p>{getApiErrorMessage(listQuery.error, "The submissions response was invalid.")}</p>
           </div>
         ) : submissions.length === 0 ? (
           <div className="submission-empty">
@@ -722,14 +634,14 @@ export default function SubmissionsDashboard() {
             <p>
               Showing {submissions.length} of {totalCount} submissions
             </p>
-            {hasMore && (
+            {listQuery.hasNextPage && (
               <button
                 type="button"
                 className="feedback-link"
-                onClick={() => setVisibleLimit((value) => value + PAGE_SIZE)}
+                onClick={() => listQuery.fetchNextPage()}
                 disabled={listQuery.isFetching}
               >
-                {listQuery.isFetching && <Loader2 className="spin" size={14} />}
+                {listQuery.isFetchingNextPage && <Loader2 className="spin" size={14} />}
                 Load more
               </button>
             )}

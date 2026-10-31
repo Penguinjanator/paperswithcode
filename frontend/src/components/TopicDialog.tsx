@@ -1,25 +1,19 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useLocation } from 'react-router-dom';
 import { ArrowRight, Check, Plus } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { catalogApi } from '@/lib/api/catalog';
-import { researchApi, TOPIC_MAX_LENGTH, type FollowKind } from '@/lib/api/research';
+import { hfLoginUrl } from '@/lib/apiUrl';
+import { researchApi, TOPIC_MAX_LENGTH, type FollowKind, type FollowSuggestion } from '@/lib/api/research';
 import { useAuth } from '@/lib/authContext';
 import { displayTaskName } from '@/lib/transform';
-import { stashPendingFollows, stashPendingTopic, useSaveFollows, useSaveTopic, type FollowPick } from '@/lib/researchTopic';
-import { hfLoginUrl } from './HfSignInButton';
+import { researchQueryKeys, TEN_MINUTES } from '@/lib/api/queryKeys';
+import { stashPendingFollows, stashPendingTopic, useResearchFollows, useSaveFollows, useSaveTopic, type FollowPick } from '@/lib/researchTopic';
 
-// Well-known researchers; author popularity has no data signal, since citation ranks favour coauthors of a few huge papers.
-const POPULAR_AUTHORS = [
-  { id: '266', name: 'Yann LeCun' },
-  { id: '4049', name: 'Jürgen Schmidhuber' },
-  { id: '13379', name: 'Geoffrey Hinton' },
-  { id: '25', name: 'Yoshua Bengio' },
-  { id: '264', name: 'Kaiming He' },
-];
-// Suggested chips per group, after everything already followed; each group links to its full listing for more.
-const CHIPS_PER_GROUP = 5;
+// Suggestions fetched per group; each group shows as many as fit in two rows, after everything already followed,
+// and links to its full listing for more.
+const SUGGESTIONS_PER_GROUP = 16;
 
 /** Builds the Following feed in a pop-up, so /following shows no input field next to the chat box:
  * a free-text topic plus trending tasks and methods, popular authors, and organizations to follow. Guests sign in on submit, and
@@ -35,27 +29,26 @@ export default function TopicDialog({ open, onOpenChange }: { open: boolean; onO
 function TopicDialogForm({ onDone }: { onDone: () => void }) {
   const { user } = useAuth();
   const location = useLocation();
-  const topic = useQuery({ queryKey: ['research-topic', user?.hf_subject], queryFn: researchApi.topic, enabled: !!user });
-  const follows = useQuery({ queryKey: ['research-follows', user?.hf_subject], queryFn: researchApi.follows, enabled: !!user });
+  const topic = useQuery({ queryKey: researchQueryKeys.topic(user?.hf_subject), queryFn: researchApi.topic, enabled: !!user });
+  const follows = useResearchFollows();
   const tasks = useQuery({
-    queryKey: ['trending-tasks-sidebar'],
-    queryFn: () => catalogApi.trendingTasks({ limit: 8, level: 0 }),
-    staleTime: 10 * 60 * 1000,
+    queryKey: ['trending-tasks-follow'],
+    queryFn: () => catalogApi.trendingTasks({ limit: SUGGESTIONS_PER_GROUP, level: 0 }),
+    staleTime: TEN_MINUTES,
   });
   const methods = useQuery({
     queryKey: ['trending-methods-follow'],
-    queryFn: () => catalogApi.trendingMethods({ limit: CHIPS_PER_GROUP }),
-    staleTime: 10 * 60 * 1000,
+    queryFn: () => catalogApi.trendingMethods({ limit: SUGGESTIONS_PER_GROUP }),
+    staleTime: TEN_MINUTES,
   });
-  const organizations = useQuery({
-    queryKey: ['organizations', 'featured'],
-    queryFn: () => catalogApi.organizationIndex(),
-    staleTime: 10 * 60 * 1000,
+  // Popular authors and the directory's top organizations, with faces and logos.
+  const suggestions = useQuery({
+    queryKey: ['research-follow-suggestions'],
+    queryFn: researchApi.followSuggestions,
+    staleTime: TEN_MINUTES,
   });
-  // The directory's curated order puts the best-known labs first.
-  const popularOrganizations = (organizations.data?.results ?? [])
-    .filter(org => org.display_order != null)
-    .sort((a, b) => a.display_order! - b.display_order!);
+  const suggested = (items: FollowSuggestion[] = []) =>
+    items.map(item => ({ id: String(item.entity_id), name: item.name, image: item.image_url }));
   const [draft, setDraft] = useState<string | null>(null);
   // The follow state chosen per chip; submit sends only those that differ from the current follows,
   // so chips stay right when a partial save refreshes the follows.
@@ -100,28 +93,31 @@ function TopicDialogForm({ onDone }: { onDone: () => void }) {
   const chips = (
     title: string,
     kind: FollowKind,
-    suggestions: { id: string; name: string; slug?: string | null }[],
+    suggestions: { id: string; name: string; slug?: string | null; image?: string | null }[],
     browse?: { to: string; label: string },
   ) => {
-    const followed = (follows.data ?? []).filter(follow => follow.kind === kind)
-      .map(follow => ({ id: String(follow.entity_id), name: follow.name, slug: follow.url.split('/').pop() }));
+    const followed = (follows.data ?? []).filter(follow => follow.kind === kind).map(follow => ({
+      id: String(follow.entity_id), name: follow.name, slug: follow.url.split('/').pop(), image: follow.image_url,
+    }));
     const items = [
       ...followed,
-      ...suggestions.filter(item => !isFollowed(kind, item.id)).slice(0, CHIPS_PER_GROUP),
+      ...suggestions.filter(item => !isFollowed(kind, item.id)).map(item => ({ ...item, suggested: true })),
     ];
     return items.length > 0 && <div className="topic-dialog-group">
       <h3>{title}</h3>
-      <div className="topic-dialog-chips">
+      <TwoRowChips>
         {items.map(item => {
           const on = isSelected(kind, item.id);
           const name = kind === 'task' ? displayTaskName(item.name, item.slug ?? undefined) : item.name;
           return <button key={item.id} type="button" className="topic-dialog-chip" aria-pressed={on} disabled={saving}
-            onClick={() => toggle(kind, item.id, name)}>
-            {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}{name}
+            data-suggested={'suggested' in item || undefined} onClick={() => toggle(kind, item.id, name)}>
+            {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
+            {(kind === 'author' || kind === 'organization') && <ChipImage kind={kind} name={name} src={item.image} />}
+            {name}
           </button>;
         })}
         {browse && <Link to={browse.to} className="topic-dialog-browse">{browse.label}<ArrowRight aria-hidden="true" /></Link>}
-      </div>
+      </TwoRowChips>
     </div>;
   };
   return <form className="topic-dialog-form" onSubmit={event => {
@@ -149,8 +145,8 @@ function TopicDialogForm({ onDone }: { onDone: () => void }) {
     {chips('Trending tasks', 'task', tasks.data?.results ?? [], { to: '/tasks', label: 'Browse tasks' })}
     {chips('Trending methods', 'method', methods.data?.results ?? [], { to: '/methods', label: 'Browse methods' })}
     {chips('Benchmarks', 'benchmark', [], { to: '/tasks', label: 'Browse benchmarks' })}
-    {chips('Popular authors', 'author', POPULAR_AUTHORS)}
-    {chips('Popular organizations', 'organization', popularOrganizations,
+    {chips('Popular authors', 'author', suggested(suggestions.data?.authors))}
+    {chips('Popular organizations', 'organization', suggested(suggestions.data?.organizations),
       { to: '/organizations', label: 'Browse organizations' })}
     {(saveTopic.error || saveFollows.error) && <p className="settings-token-error" role="alert">
       Could not save your feed. Please try again.
@@ -165,4 +161,36 @@ function TopicDialogForm({ onDone }: { onDone: () => void }) {
       </button>
     </div>
   </form>;
+}
+
+/** Wraps chips, hiding trailing suggestions until followed chips, suggestions, and the browse link fit in two rows. */
+function TwoRowChips({ children }: { children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const box = ref.current;
+    if (!box) return;
+    const fit = () => {
+      const all = [...box.children] as HTMLElement[];
+      const suggested = all.filter(element => element.dataset.suggested);
+      suggested.forEach(element => { element.hidden = false; });
+      const rows = () => new Set(all.filter(element => !element.hidden).map(element => element.offsetTop)).size;
+      for (let i = suggested.length - 1; i >= 0 && rows() > 2; i--) suggested[i].hidden = true;
+    };
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  });
+  return <div ref={ref} className="topic-dialog-chips">{children}</div>;
+}
+
+/** A face for authors and a logo for organizations; authors without a photo show their initials. */
+function ChipImage({ kind, name, src }: { kind: 'author' | 'organization'; name: string; src?: string | null }) {
+  const [failed, setFailed] = useState(false);
+  if (src && !failed) {
+    return <img className={`topic-dialog-chip-image is-${kind}`} src={src} alt="" loading="lazy"
+      onError={() => setFailed(true)} />;
+  }
+  if (kind !== 'author') return null;
+  const initials = name.split(/\s+/).filter(Boolean).map(part => part[0]).slice(0, 2).join('').toUpperCase();
+  return <span className="topic-dialog-chip-image is-author is-initials" aria-hidden="true">{initials}</span>;
 }

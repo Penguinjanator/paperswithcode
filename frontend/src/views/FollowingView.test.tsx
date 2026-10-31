@@ -11,8 +11,8 @@ import FeedView from './FeedView';
 const auth = vi.hoisted(() => ({ user: { hf_subject: 'alice', username: 'alice' } as { hf_subject: string; username: string } | null, isLoading: false }));
 vi.mock('@/lib/authContext', () => ({ useAuth: () => auth, useOptionalAuth: () => auth }));
 const login = vi.hoisted(() => ({ hfLoginUrl: vi.fn(() => window.location.href) }));
-vi.mock('@/components/HfSignInButton', async importOriginal => ({
-  ...await importOriginal<typeof import('@/components/HfSignInButton')>(), hfLoginUrl: login.hfLoginUrl,
+vi.mock('@/lib/apiUrl', async importOriginal => ({
+  ...await importOriginal<typeof import('@/lib/apiUrl')>(), hfLoginUrl: login.hfLoginUrl,
 }));
 vi.mock('@/hooks/useIntersectionObserver', () => ({ useIntersectionObserver: () => ({ targetRef: () => {}, isIntersecting: false }) }));
 const paper = { id: '1', arxiv_id: '2610.12345', title: 'A paper', abstract: 'Full abstract.',
@@ -22,6 +22,7 @@ function renderFeed(path = '/following') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/" element={<FeedView />} /><Route path="/following" element={<FollowingView />} />
+    <Route path="/x-trending" element={<FeedView xTrending />} />
   </Routes></MemoryRouter></QueryClientProvider>);
 }
 beforeEach(() => {
@@ -29,7 +30,11 @@ beforeEach(() => {
   vi.stubEnv('VITE_CHAT_ENABLED', '0');
   vi.spyOn(catalogApi, 'topTasks').mockResolvedValue([]);
   vi.spyOn(catalogApi, 'trendingTasks').mockResolvedValue({ results: [], recent_days: 7, baseline_days: 30 });
-  vi.spyOn(catalogApi, 'organizationIndex').mockResolvedValue({ count: 0, results: [] } as never);
+  vi.spyOn(researchApi, 'followSuggestions').mockResolvedValue({ authors: [
+    { entity_id: 266, name: 'Yann LeCun', url: '/authors/266', image_url: '/api/v1/authors/266/photo/abc.jpg' },
+    { entity_id: 25, name: 'Yoshua Bengio', url: '/authors/25', image_url: null },
+    { entity_id: 264, name: 'Kaiming He', url: '/authors/264', image_url: null },
+  ], organizations: [] });
   vi.spyOn(catalogApi, 'trendingMethods').mockResolvedValue({ results: [], recent_days: 7, baseline_days: 30 } as never);
   vi.spyOn(papersApi, 'list').mockResolvedValue({ count: 0, results: [], next_page: null, previous_page: null });
   vi.spyOn(researchApi, 'follows').mockResolvedValue([
@@ -52,7 +57,7 @@ it('renders following in the existing tab row with standard paper cards and thum
   expect(screen.getByText('Full abstract.')).toBeInTheDocument();
   const tab = screen.getByRole('button', { name: 'following' });
   expect(tab).toHaveClass('active');
-  expect(tab.parentElement?.textContent).toBe('trendingfollowing');
+  expect(tab.parentElement?.textContent).toBe('trendingtrending (X)following');
   expect(screen.queryByText('Discover')).not.toBeInTheDocument();
   expect(papersApi.list).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole('button', { name: 'trending' }));
@@ -185,11 +190,12 @@ it('explains how to follow when a signed-in account follows nothing yet', async 
   vi.mocked(catalogApi.trendingMethods).mockResolvedValue({ results: [
     { id: '9', name: 'LoRA', slug: 'lora' },
   ], recent_days: 7, baseline_days: 30 } as never);
-  vi.mocked(catalogApi.organizationIndex).mockResolvedValue({ count: 3, results: [
-    { id: '1', name: 'Microsoft', slug: 'microsoft', display_order: 1 },
-    { id: '3', name: 'NVIDIA', slug: 'nvidia', display_order: 3 },
-    { id: '8', name: 'Unranked Lab', slug: 'unranked', display_order: null },
-  ] } as never);
+  vi.mocked(researchApi.followSuggestions).mockResolvedValue({ authors: [
+    { entity_id: 266, name: 'Yann LeCun', url: '/authors/266', image_url: '/api/v1/authors/266/photo/abc.jpg' },
+  ], organizations: [
+    { entity_id: 1, name: 'Microsoft', url: '/orgs/microsoft', image_url: null },
+    { entity_id: 3, name: 'NVIDIA', url: '/orgs/nvidia', image_url: '/api/v1/organizations/nvidia/logo/abc.png' },
+  ] });
   vi.spyOn(researchApi, 'setTopic').mockResolvedValue({ ...topic, status: 'pending' });
   vi.spyOn(researchApi, 'setFollow').mockResolvedValue(undefined);
   renderFeed();
@@ -202,8 +208,9 @@ it('explains how to follow when a signed-in account follows nothing yet', async 
   expect(task).toHaveAttribute('aria-pressed', 'true');
   fireEvent.click(await screen.findByRole('button', { name: 'LoRA' }));
   fireEvent.click(screen.getByRole('button', { name: 'Yann LeCun' }));
-  fireEvent.click(await screen.findByRole('button', { name: 'NVIDIA' }));
-  expect(screen.queryByRole('button', { name: 'Unranked Lab' })).not.toBeInTheDocument();
+  const nvidia = await screen.findByRole('button', { name: 'NVIDIA' });
+  expect(nvidia.querySelector('img')).toHaveAttribute('src', '/api/v1/organizations/nvidia/logo/abc.png');
+  fireEvent.click(nvidia);
   fireEvent.change(screen.getByRole('textbox', { name: 'Research topic' }), { target: { value: 'real-time video generation' } });
   fireEvent.click(screen.getByRole('button', { name: 'Follow' }));
   await waitFor(() => expect(researchApi.setTopic).toHaveBeenCalledWith('real-time video generation'));
@@ -213,15 +220,24 @@ it('explains how to follow when a signed-in account follows nothing yet', async 
   expect(researchApi.setFollow).toHaveBeenCalledWith('organization', '3', true);
 });
 
-it('shows the top five per group with links to browse the rest', async () => {
+it('fills two rows per group with suggestions, then links to browse the rest', async () => {
+  // jsdom has no layout: lay chips out four per row.
+  vi.spyOn(HTMLElement.prototype, 'offsetTop', 'get').mockImplementation(function (this: HTMLElement) {
+    const visible = [...(this.parentElement?.children ?? [])].filter(element => !(element as HTMLElement).hidden);
+    return Math.floor(visible.indexOf(this) / 4) * 30;
+  });
   vi.mocked(researchApi.follows).mockResolvedValue([]);
   vi.mocked(researchApi.following).mockResolvedValue([]);
   vi.mocked(catalogApi.trendingTasks).mockResolvedValue({ results: Array.from({ length: 8 }, (_, i) => (
     { id: String(i + 1), name: `Task ${i + 1}`, slug: `task-${i + 1}`, share_lift: 2 } as never)), recent_days: 7, baseline_days: 30 });
   renderFeed();
-  expect(await screen.findByRole('button', { name: 'Task 5' })).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: 'Task 6' })).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Kaiming He' })).toBeInTheDocument();
+  // Eight tasks and the browse link need three rows, so the last task gives way.
+  expect(await screen.findByRole('button', { name: 'Task 7' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Task 8' })).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Yann LeCun' }).querySelector('img'))
+    .toHaveAttribute('src', '/api/v1/authors/266/photo/abc.jpg');
+  // Authors without a photo show their initials.
+  expect(screen.getByRole('button', { name: 'Kaiming He' })).toHaveTextContent('KH');
   expect(screen.queryByRole('button', { name: 'Fei-Fei Li' })).not.toBeInTheDocument();
   expect(screen.getByRole('link', { name: 'Browse tasks' })).toHaveAttribute('href', '/tasks');
 });
@@ -398,4 +414,17 @@ it('shows the feed for an account that follows only a topic', async () => {
   expect(await screen.findByText(/Showing the closest papers about \u201creal-time video generation\u201d now/)).toBeInTheDocument();
   expect(await screen.findByText('A paper')).toBeInTheDocument();
   expect(screen.queryByRole('heading', { name: 'Build your personal research feed' })).not.toBeInTheDocument();
+});
+it('lists papers shared on X under the trending (X) tab, over the homepage week window', async () => {
+  const xTrending = vi.spyOn(papersApi, 'xTrending').mockResolvedValue({ count: 1, results: [paper], next_page: null, previous_page: null } as never);
+  renderFeed('/');
+  fireEvent.click(await screen.findByRole('button', { name: 'trending (X)' }));
+  expect(await screen.findByText('A paper')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'trending (X)' })).toHaveClass('active');
+  expect(screen.getByRole('button', { name: 'trending' })).not.toHaveClass('active');
+  expect(screen.getByText('Papers people share most on X, picked daily')).toBeInTheDocument();
+  expect(xTrending).toHaveBeenCalledWith(expect.objectContaining({ page: 1, page_size: 30, include_resources: true }));
+  const { start_date, end_date } = xTrending.mock.calls[0][0]!;
+  expect(start_date && end_date && start_date < end_date).toBeTruthy();
+  expect(researchApi.following).not.toHaveBeenCalled();
 });

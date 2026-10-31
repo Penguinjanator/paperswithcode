@@ -14,7 +14,8 @@ import React from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
-import { PaperCard, TagChip } from "@/components";
+import { PaperCard } from "@/components/PaperCard";
+import { TagChip } from "@/components/Chips";
 import HfSignInButton from "@/components/HfSignInButton";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -33,7 +34,6 @@ const SavedPapersView: React.FC = () => {
     queryFn: () => accountApi.getBookmarks(),
     enabled: !!user,
     staleTime: 30 * 1000,
-    refetchOnWindowFocus: false,
   });
   const bucketAuthorizationRequired =
     query.error instanceof ApiError &&
@@ -72,6 +72,9 @@ const SavedPapersView: React.FC = () => {
       </div>
     );
   }
+
+  // Position across all task groups, so only the first cards on the page load eagerly.
+  let cardPosition = 0;
 
   return (
     <div className="page">
@@ -197,7 +200,7 @@ const SavedPapersView: React.FC = () => {
                       <PaperCard
                         key={paper.id}
                         paper={transformPaperForCard(paper)}
-                        rank={1}
+                        priority={cardPosition++ < 3}
                       />
                     ))}
                   </div>

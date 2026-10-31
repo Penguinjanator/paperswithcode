@@ -1,13 +1,13 @@
 import FollowingIntro from "@/components/FollowingIntro";
 import TopicDialog from "@/components/TopicDialog";
 import { isAuthDisabled } from "@/lib/apiUrl";
-import { clearPendingTopic, readPendingFollows, readPendingTopic, useSaveFollows, useSaveTopic } from "@/lib/researchTopic";
+import { clearPendingTopic, readPendingFollows, readPendingTopic, useResearchFollows, useSaveFollows, useSaveTopic } from "@/lib/researchTopic";
 import { useOptionalAuth } from "@/lib/authContext";
 import { researchApi, type FollowKind } from "@/lib/api/research";
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 
-import { PaperCard } from "@/components";
+import { PaperFeedList, type PaperFeedCard } from "@/components/PaperFeed";
 import { McpShowcase } from "@/components/McpShowcase";
 import { PaperDateFilter } from "@/components/PaperDateFilter";
 import { ArrowUpIcon } from "@/components/chat/icons";
@@ -30,11 +30,15 @@ import {
   DEFAULT_CHAT_MODEL,
 } from "@/lib/chatSessions";
 import { displayTaskName, transformPaperForCard } from "@/lib/transform";
-import { useInfinitePapers } from "@/hooks/usePapers";
-import { useIntersectionObserver } from "@/hooks/useIntersectionObserver";
+import { usePaperFeedQuery } from "@/hooks/usePapers";
+import type { Paper } from "@/lib/api/papers.types";
+import type { PaginatedResponse } from "@/lib/api/shared.types";
+import { papersApi } from "@/lib/api/papers";
+import { paperQueryKeys } from "@/lib/paperQueryKeys";
+import { catalogQueryKeys, researchQueryKeys, TEN_MINUTES } from "@/lib/api/queryKeys";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   readHomepagePaperDateRange,
   withHomepagePaperDateRange,
@@ -303,7 +307,23 @@ const FOLLOW_KIND_LABELS: Record<FollowKind, string> = {
 };
 const FOLLOW_KIND_ORDER = Object.keys(FOLLOW_KIND_LABELS) as FollowKind[];
 
-const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
+type FeedMode = "trending" | "x" | "following";
+
+const FEED_PAGE_SIZE = 30;
+const FOLLOWING_PAGE_SIZE = 40;
+
+interface FeedPage {
+  results: { paper: Paper; reasons?: string[] }[];
+  next_page: number | null;
+}
+
+const toFeedPage = async (request: Promise<PaginatedResponse<Paper>>): Promise<FeedPage> => {
+  const page = await request;
+  return { results: page.results.map((paper) => ({ paper })), next_page: page.next_page };
+};
+
+export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
+  const following = mode === "following";
   const navigate = useNavigate();
   const auth = useOptionalAuth();
   const user = auth?.user;
@@ -311,14 +331,14 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   // Following defaults to its 30-day match window; the other tabs default to a week.
   const dateRange = readHomepagePaperDateRange(searchParams, undefined, following ? "month" : "week");
 
-  // The home feed only offers trending and following; newest and most cited
-  // stay on the other paper feeds.
-  const showTrending = () => {
+  // The home feed only offers trending, following and trending on X; newest
+  // and most cited stay on the other paper feeds.
+  const showTab = (path: string) => {
     const next = new URLSearchParams(searchParams);
     next.delete("order_by");
     next.delete("only");
     const query = next.toString();
-    navigate(query ? `/?${query}` : "/");
+    navigate(query ? `${path}?${query}` : path);
   };
 
   const topicFilterHref = (active: boolean) => {
@@ -331,9 +351,9 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
 
   // Sidebar: top tasks by paper count.
   const topTasks = useQuery({
-    queryKey: ["top-tasks-sidebar"],
+    queryKey: catalogQueryKeys.topTasksSidebar,
     queryFn: () => catalogApi.topTasks(8),
-    staleTime: 10 * 60 * 1000,
+    staleTime: TEN_MINUTES,
   });
 
   // Sidebar: tasks whose share of recent papers is rising vs their baseline.
@@ -342,35 +362,33 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   const trendingTasks = useQuery({
     queryKey: ["trending-tasks-sidebar"],
     queryFn: () => catalogApi.trendingTasks({ limit: 8, level: 0 }),
-    staleTime: 10 * 60 * 1000,
-  });
-
-  const publicFeed = useInfinitePapers({
-    enabled: !following,
-    page_size: 30,
-    order_by: "trending",
-    order_dir: "desc",
-    start_date: dateRange.startDate,
-    end_date: dateRange.endDate,
-    include_resources: true,
+    staleTime: TEN_MINUTES,
   });
 
   const topicOnly = following && searchParams.get("only") === "topic";
+  const dateFilters = { start_date: dateRange.startDate, end_date: dateRange.endDate };
   const followingFilters = { ...dateRange, topicOnly };
-  const followedFeed = useInfiniteQuery({
-    queryKey: ["research-feed", user?.hf_subject, followingFilters],
-    queryFn: ({ pageParam }) => researchApi.following(pageParam, followingFilters),
-    initialPageParam: 0,
-    getNextPageParam: (last, pages) => last.length === 40 ? pages.length * 40 : undefined,
-    enabled: following && !!user,
-  });
-  const follows = useQuery({
-    queryKey: ["research-follows", user?.hf_subject],
-    queryFn: researchApi.follows,
-    enabled: following && !!user,
-  });
+  // Following pages by offset; the public feeds by page number.
+  const infinite = usePaperFeedQuery<FeedPage>(
+    following
+      ? [...paperQueryKeys.feeds.following, user?.hf_subject, followingFilters]
+      : [...(mode === "x" ? paperQueryKeys.feeds.xTrending : paperQueryKeys.feeds.trending), dateFilters],
+    async (page) => {
+      if (following) {
+        const entries = await researchApi.following(page, followingFilters);
+        const next_page = entries.length === FOLLOWING_PAGE_SIZE ? page + FOLLOWING_PAGE_SIZE : null;
+        return { results: entries, next_page };
+      }
+      const params = { ...dateFilters, page, page_size: FEED_PAGE_SIZE, include_resources: true };
+      return toFeedPage(mode === "x"
+        ? papersApi.xTrending(params)
+        : papersApi.list({ ...params, order_by: "trending", order_dir: "desc", latest_only: true }));
+    },
+    { enabled: !following || !!user, initialPage: following ? 0 : 1 },
+  );
+  const follows = useResearchFollows(following);
   const topic = useQuery({
-    queryKey: ["research-topic", user?.hf_subject],
+    queryKey: researchQueryKeys.topic(user?.hf_subject),
     queryFn: researchApi.topic,
     enabled: following && !!user,
     refetchInterval: query => query.state.data && ["pending", "running"].includes(query.state.data.status) ? 10000 : false,
@@ -383,7 +401,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   const wasBuilding = useRef(false);
   useEffect(() => {
     if (wasBuilding.current && !topicBuilding) {
-      void queryClient.invalidateQueries({ queryKey: ["research-feed", user?.hf_subject] });
+      void queryClient.invalidateQueries({ queryKey: researchQueryKeys.feed(user?.hf_subject) });
     }
     wasBuilding.current = topicBuilding;
   }, [topicBuilding, queryClient, user?.hf_subject]);
@@ -430,20 +448,13 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
   );
   // Keep the follows section up while auth or follows load so the domain lists never flash in.
   const showFollowsSidebar = following && (!!auth?.isLoading || (!!user && !noFollows));
-  const infinite = following ? followedFeed : publicFeed;
-  const cards = useMemo(() => following
-    ? followedFeed.data?.pages.flatMap(page => page.map(entry => ({ ...transformPaperForCard(entry.paper), followReasons: entry.reasons }))) ?? []
-    : publicFeed.data?.pages.flatMap(page => page.results.map(paper => ({ ...transformPaperForCard(paper), followReasons: undefined }))) ?? [],
-  [following, followedFeed.data, publicFeed.data]);
+  const cards = useMemo<PaperFeedCard[]>(
+    () => infinite.data?.pages.flatMap((page) =>
+      page.results.map((entry) => ({ ...transformPaperForCard(entry.paper), followReasons: entry.reasons })),
+    ) ?? [],
+    [infinite.data],
+  );
 
-  const { targetRef: sentinelRef, isIntersecting } = useIntersectionObserver({ rootMargin: "400px" });
-  useEffect(() => {
-    if (isIntersecting && infinite.hasNextPage && !infinite.isFetchingNextPage) {
-      infinite.fetchNextPage();
-    }
-  }, [isIntersecting, infinite.hasNextPage, infinite.isFetchingNextPage]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const isLoading = infinite.isLoading || (following && auth?.isLoading);
   const error = infinite.error;
 
   return (
@@ -453,7 +464,7 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
           <h1 className="feed-title">
             Trending <em>Research</em>
           </h1>
-          <div className="feed-subtitle">Curated daily from arXiv and Hugging Face</div>
+          <div className="feed-subtitle">{mode === "x" ? "Papers people share most on X, picked daily" : "Curated daily from arXiv and Hugging Face"}</div>
         </div>
       </div>
 
@@ -565,13 +576,9 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
             <div className="sort-bar home-feed-sort-bar">
               <div className="paper-feed-toolbar-controls">
                 <div className="sort-options">
-                  <button className={`sort-btn ${following ? "" : "active"}`} onClick={showTrending}>trending</button>
-                  <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => {
-                    const next = new URLSearchParams(searchParams);
-                    next.delete("order_by");
-                    const query = next.toString();
-                    navigate(query ? `/following?${query}` : "/following");
-                  }}>following</button>
+                  <button className={`sort-btn ${mode === "trending" ? "active" : ""}`} onClick={() => showTab("/")}>trending</button>
+                  <button className={`sort-btn ${mode === "x" ? "active" : ""}`} onClick={() => showTab("/x-trending")}>trending (X)</button>
+                  <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => showTab("/following")}>following</button>
                 </div>
               </div>
               <PaperDateFilter
@@ -627,37 +634,15 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
 
             {showIntro ? (
               <FollowingIntro onBuild={canBuildFeed ? () => setEditingTopic(true) : undefined} />
-            ) : isLoading ? (
-              <div className="paper-list">
-                {Array.from({ length: 6 }).map((_, i) => (
-                  <div key={i} className="paper-card">
-                    <div className="paper-thumb-wrap">
-                      <Skeleton className="paper-thumb-skeleton" />
-                    </div>
-                    <div className="paper-body" style={{ flex: 1, gap: 12 }}>
-                      <Skeleton className="h-6 w-3/4" />
-                      <Skeleton className="h-4 w-1/2" />
-                      <Skeleton className="h-12 w-full" />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : cards.length === 0 ? (error ? null :
-              <div className="no-results">{topicOnly ? <>No papers about your topic match these filters. Widen the date range or <button type="button" className="link-button" onClick={() => setEditingTopic(true)}>edit your topic</button>.</> : following ? <>No papers from your topic or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}</div>
             ) : (
-              <>
-                <div className="paper-list">
-                  {cards.map((p, i) => (
-                    <PaperCard key={p.id} paper={p} rank={i + 1} followReasons={p.followReasons} />
-                  ))}
-                </div>
-                <div ref={sentinelRef} style={{ height: 1 }} />
-                {infinite.isFetchingNextPage && (
-                  <div style={{ padding: "20px 0", textAlign: "center", color: "var(--ink-faint)" }}>
-                    Loading more…
-                  </div>
-                )}
-              </>
+              <PaperFeedList
+                query={infinite}
+                isLoading={infinite.isLoading || (following && !!auth?.isLoading)}
+                cards={cards}
+                skeleton="card"
+                rootMargin="400px"
+                empty={error ? null : topicOnly ? <>No papers about your topic match these filters. Widen the date range or <button type="button" className="link-button" onClick={() => setEditingTopic(true)}>edit your topic</button>.</> : following ? <>No papers from your topic or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : mode === "x" ? "No papers shared on X in this window." : "No papers in this window."}
+              />
             )}
           </div>
         </div>
@@ -665,5 +650,10 @@ const FeedView: React.FC<{ following?: boolean }> = ({ following = false }) => {
     </div>
   );
 };
+
+// Routes render the public feeds through this; FollowingView renders the following mode.
+const FeedView: React.FC<{ xTrending?: boolean }> = ({ xTrending = false }) => (
+  <HomeFeed mode={xTrending ? "x" : "trending"} />
+);
 
 export default FeedView;

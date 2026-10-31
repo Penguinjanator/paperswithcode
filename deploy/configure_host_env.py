@@ -561,7 +561,7 @@ def scope_title_hf_values(
         "PWC_CHAT_SCOPE_GUARDRAIL_HF_BILL_TO": bill_to,
         "PWC_CHAT_SCOPE_GUARDRAIL_GLM_MODEL": ("zai-org/GLM-5.3-Flash:baseten"),
         "PWC_CHAT_SCOPE_GUARDRAIL_OPENAI_API_KEY": fallback,
-        "PWC_CHAT_SCOPE_GUARDRAIL_OPENAI_MODEL": "gpt-5.6-luna",
+        "PWC_CHAT_SCOPE_GUARDRAIL_OPENAI_MODEL": "gpt-6-luna",
         "PWC_CHAT_POSTERLY_ENABLED": "false",
     }
     if environment == "staging":
@@ -1617,7 +1617,7 @@ def production_codex_values(
         "PWC_CODEX_JOBS_TOKEN": decoded_value(legacy["PWC_HF_TOKEN"]),
         **production_codex_image_values(),
         "PWC_CODEX_JOBS_CLI_VERSION": "0.75.0",
-        "PWC_CODEX_JOBS_MODEL": "gpt-5.6-luna",
+        "PWC_CODEX_JOBS_MODEL": "gpt-6-luna",
         "PWC_CODEX_JOBS_REASONING_EFFORT": "medium",
         "PWC_CODEX_JOBS_MAX_ACTIVE": "4",
         "PWC_CODEX_JOBS_MAX_SCHEDULED_ACTIVE": "3",
