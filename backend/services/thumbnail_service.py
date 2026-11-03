@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from backend.config import get_settings
 from backend.services.arxiv_service import ArxivPdfUnavailableError, ArxivService
+from backend.services.paper_markdown_service import stream_external_paper_pdf
 from backend.services.safe_outbound_http_service import (
     SafeOutboundHttpError,
     fetch_public_resource,
@@ -52,9 +53,17 @@ EXTERNAL_THUMBNAIL_DIRECT_HOSTS = frozenset(
         "ecmlpkdd-storage.s3.eu-central-1.amazonaws.com",
         "github.com",
         "huggingface.co",
+        # huggingface.co/.../resolve/... redirects LFS and Xet files to these CDNs.
+        "cas-bridge.xethub.hf.co",
+        "cdn-lfs.hf.co",
+        "cdn-lfs-eu-1.hf.co",
+        "cdn-lfs-us-1.hf.co",
+        "us.aws.cdn.hf.co",
         "ieeexplore.ieee.org",
         # github.com/<owner>/<repo>/raw/... redirects Git LFS files here.
         "media.githubusercontent.com",
+        # ECCV conference PDFs (papers.conference_url_pdf).
+        "media.eventhosts.cc",
         "medrxiv.org",
         "microsoft.ai",
         "nature.com",
@@ -78,6 +87,11 @@ EXTERNAL_THUMBNAIL_DIRECT_HOSTS = frozenset(
         "www.openai.com",
         "zenodo.org",
     }
+)
+# raw.githubusercontent.com and many object stores label PDFs as generic binary;
+# the `%PDF` magic-byte check below still rejects anything that is not a PDF.
+EXTERNAL_PDF_CONTENT_TYPES = frozenset(
+    {"application/pdf", "application/octet-stream", "binary/octet-stream"}
 )
 PERMANENT_EXTERNAL_PDF_SAFE_STATUSES = frozenset({403, 409, 413, 415, 422})
 PERMANENT_EXTERNAL_PDF_ORIGIN_STATUSES = frozenset({403, 404, 410})
@@ -649,7 +663,7 @@ class ThumbnailService:
         try:
             result = await fetch_public_resource(
                 pdf_url,
-                allowed_content_types=frozenset({"application/pdf"}),
+                allowed_content_types=EXTERNAL_PDF_CONTENT_TYPES,
                 max_bytes=self.max_pdf_size,
                 timeout_seconds=self.pdf_timeout,
                 allowed_hosts=EXTERNAL_THUMBNAIL_DIRECT_HOSTS,
@@ -673,6 +687,24 @@ class ThumbnailService:
         if not result.body.startswith(b"%PDF"):
             return None
         return result.body
+
+    def _read_archived_external_pdf(self, paper_id: int | str) -> Optional[bytes]:
+        """
+        Read the PDF archived at ingestion or by the OCR worker, if any.
+
+        Covers sources that moved or vanished upstream after indexing.
+        """
+        try:
+            chunks, size = stream_external_paper_pdf(
+                str(paper_id),
+                bucket_id=self.settings.paper_markdown_hf_bucket_id,
+                token=self.settings.hf_token,
+            )
+        except ValueError:
+            return None
+        if size > self.max_pdf_size:
+            return None
+        return b"".join(chunks)
 
     def _save_thumbnail(self, image: Image.Image, cache_path: Path) -> None:
         """
@@ -858,7 +890,8 @@ class ThumbnailService:
 
         Direct PDFs are rendered from their first page; `pdf_url` (e.g. the
         paper's conference PDF) is tried before `source_url`, which is often
-        an HTML landing page. bioRxiv and medRxiv records can fall back to a
+        an HTML landing page, and the archived copy is used when neither
+        serves a PDF. bioRxiv and medRxiv records can fall back to a
         metadata card when their PDF is unavailable.
         """
         filename = self.get_external_filename(paper_id)
@@ -888,6 +921,8 @@ class ThumbnailService:
                 pdf_url_error = exc
         if pdf_content is None:
             pdf_content = await self._download_external_pdf(source_url)
+        if pdf_content is None:
+            pdf_content = self._read_archived_external_pdf(paper_id)
         if pdf_content is None and pdf_url_error is not None:
             # Retry later instead of caching a metadata card in place of
             # a PDF that is only temporarily unavailable.
