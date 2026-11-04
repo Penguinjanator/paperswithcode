@@ -226,6 +226,15 @@ is too short or does not carry the paper's title near the top is recorded under
 `_jobs/web-status/external/<id>.json` and not scraped again; transient failures
 retry with backoff, at most three times.
 
+The same lanes check up to 60 pages per run for whether the reader may show the
+original page in a frame. Each check is a header-only GET that follows redirects
+by hand, requiring HTTPS and publicly routable addresses on every hop. The
+verdict (`framing` in the status record) is refreshed weekly, or daily for
+unreachable pages. The reader frames a page when
+`GET /api/v1/papers/{paper_id}/web-page` reports `frameable`, and always frames
+`*.github.io`, which cannot send framing headers. Every other page is read as
+Markdown.
+
 For MCP operations, start with `pwc-status --component mcp` and inspect
 `journalctl -u paperswithcode-mcp@staging.service` (or `production`). Operational
 MCP telemetry is limited to tool name, status, latency, response bytes, protocol
@@ -797,9 +806,11 @@ age and becomes critical at five hours. Scheduled dispatch automatically pauses
 after a server invariant breach, three consecutive trace/apply/verification
 failures, a greater-than-20% failure rate in the latest 25 stages, or the
 post-baseline daily token guardrail. Neither failure counter includes
-source-evidence failures or runner transport failures (`Remote runner failed
-(URLError|RemoteDisconnected|TimeoutError|…)`, a callback that never got a
-response), since neither says anything about the curation; more than half of the latest 25
+source-evidence failures (including `[awaiting_markdown]`) or runner transport
+failures (`Remote runner failed
+(URLError|RemoteDisconnected|TimeoutError|HTTPError|JSONDecodeError|…)`, one of
+the runner's own callbacks failing or getting an edge error page instead of
+JSON), since neither says anything about the curation; more than half of the latest 25
 stages failing that way pauses as `runner_transport_failures` instead. Resuming is an explicit acknowledgement
 that resets the consecutive counters and starts a fresh 25-stage failure-rate
 window; a recurring invariant breach still pauses immediately.
@@ -837,6 +848,14 @@ two-job lane, and it still runs while the daily-paper health breakers
 work; an operator, token-guardrail, or policy pause still stops it. They use the curation operator's
 `create_benchmark_from_gap` capability, the only autonomous path that creates
 datasets, metrics, or tasks (see `docs/autonomous-operations.md`).
+
+The same run also queues add-evals re-checks (trigger `benchmark-promotion`,
+policy `new-benchmark-<dataset id>`) for already-indexed papers whose stored
+Markdown names a benchmark whose first leaderboard row is from the last two
+days, whatever created it. `new_benchmark_recheck_service` caps them at 5 per
+benchmark and 20 per run, and the dispatcher runs at most two at once, so the
+admin lane cannot starve daily curation. The curator verifies every row; a
+mention alone writes nothing.
 
 Both kinds run on the existing curator image: the runner treats them as
 paper-less jobs, `jobs/url_preflight.py` skips paper sources for them, and the

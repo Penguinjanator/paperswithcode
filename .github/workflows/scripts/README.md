@@ -36,7 +36,8 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-link-google-scholar-profiles.timer` | `Wed *-*-* 05:20:00` | `link_google_scholar_profiles` | `backend/scripts/link_google_scholar_profiles.py` |
 | `pwc-cron-refresh-conference-deadlines.timer` | `*-*-* 07:40:00`<br>`*-*-* 19:40:00` | `refresh_conference_deadlines` | `backend/scripts/refresh_conference_deadlines.py` |
 | `pwc-cron-discover-x-threads.timer` | `*-*-* 08,20:22:00` | `discover_x_threads` | `backend/scripts/discover_x_threads.py` |
-| `pwc-cron-post-trending-paper-to-x.timer` | `*-*-* 00/4:13:00` | `post_trending_paper_to_x` | `backend/scripts/post_trending_paper_to_x.py` |
+| `pwc-cron-refresh-x-post-likes.timer` | `*-*-* *:35:00` | `refresh_x_post_likes` | `backend/scripts/refresh_x_post_likes.py` |
+| `pwc-cron-post-trending-paper-to-x.timer` | `*-*-* 00/8:13:00` | `post_trending_paper_to_x` | `backend/scripts/post_trending_paper_to_x.py` |
 | `pwc-cron-post-x-insight.timer` | `*-*-* 09,17:43:00` | `post_x_insight` | `backend/scripts/post_x_insight.py` |
 | `pwc-cron-warm-paper-suggested-questions.timer` | `*-*-* *:33:00` | `warm_paper_suggested_questions` | `backend/scripts/warm_paper_suggested_questions.py` |
 | `pwc-cron-sync-3d-arena.timer` | `*-*-* *:05:00` | `sync_3d_arena` | `.github/workflows/scripts/hourly/sync_3d_arena.py` |
@@ -46,7 +47,6 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-sync-open-asr.timer` | `*-*-* *:15:00` | `sync_open_asr` | `.github/workflows/scripts/hourly/sync_open_asr.py` |
 | `pwc-cron-sync-open-tts.timer` | `*-*-* *:18:00` | `sync_open_tts` | `.github/workflows/scripts/hourly/sync_open_tts.py` |
 | `pwc-cron-sync-parsebench.timer` | `*-*-* *:20:00` | `sync_parsebench` | `.github/workflows/scripts/hourly/sync_parsebench.py` |
-| `pwc-cron-sync-mmteb-retrieval.timer` | `*-*-* *:22:00` | `sync_mmteb_retrieval` | `.github/workflows/scripts/hourly/sync_mmteb.py` retrieval |
 | `pwc-cron-sync-deepswe.timer` | `*-*-* *:25:00` | `sync_deepswe` | `.github/workflows/scripts/hourly/sync_deepswe.py` |
 | `pwc-cron-sync-extractbench.timer` | `*-*-* *:32:00` | `sync_extractbench` | `.github/workflows/scripts/hourly/sync_extractbench.py` |
 | `pwc-cron-sync-vals-finance-agent.timer` | `*-*-* *:47:00` | `sync_vals_finance_agent` | `.github/workflows/scripts/hourly/sync_vals_finance_agent.py` |
@@ -63,7 +63,6 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-sync-patcheval-verified.timer` | `*-*-* *:21:00` | `sync_patcheval_verified` | `.github/workflows/scripts/hourly/sync_patcheval_verified.py` |
 | `pwc-cron-sync-physics-iq-verified.timer` | `*-*-* *:28:00` | `sync_physics_iq_verified` | `.github/workflows/scripts/hourly/sync_physics_iq_verified.py` |
 | `pwc-cron-sync-artificial-analysis.timer` | `*-*-* 00/2:35:00` | `sync_artificial_analysis` | `.github/workflows/scripts/hourly/sync_artificial_analysis.py` |
-| `pwc-cron-sync-mmteb-reranking.timer` | `*-*-* *:37:00` | `sync_mmteb_reranking` | `.github/workflows/scripts/hourly/sync_mmteb.py` reranking |
 | `pwc-cron-sync-programbench.timer` | `*-*-* *:40:00` | `sync_programbench` | `.github/workflows/scripts/hourly/sync_programbench.py` |
 | `pwc-cron-sync-mmeb-v3.timer` | `*-*-* *:42:00` | `sync_mmeb_v3` | `.github/workflows/scripts/hourly/sync_mmeb.py` v3 |
 | `pwc-cron-sync-frontiercode.timer` | `*-*-* *:45:00` | `sync_frontiercode` | `.github/workflows/scripts/hourly/sync_frontiercode.py` |
@@ -184,6 +183,25 @@ history and stores them on repositories for the trending API/view pipeline.
 `update_citations.py` pulls citation counts from Semantic Scholar for ArXiv
 papers. Runs are bounded so hourly runs do not pile up under API throttling.
 
+`refresh_x_post_likes.py` tracks how fast linked X posts gain likes, for the
+X part of the paper trending score. Hourly at :35 it adds an `x_post_metrics`
+row for each `paper_x_threads` post from the last week, then reads each post
+about 1, 2, 4, 8, 12, 24, 48, 72, 120 and 144 hours after posting and keeps an
+EMA of likes per hour. Reads use the free embed syndication endpoint first and
+fall back to the paid X API (`X_API_BEARER_TOKEN`) for at most
+`PWC_X_LIKES_API_DAILY_CAP` posts per UTC day (default 300). It only reports,
+reading through syndication and rolling back, unless `PWC_X_LIKES_APPLY=true`.
+`calculate_paper_trending_scores` ranks each paper's fastest post from the last
+week against the others (posts under `PWC_TRENDING_X_MIN_LIKES_PER_HOUR`,
+default 1, count for nothing). The X rank only lifts a paper: the score is the
+higher of the GitHub/Hugging Face score and the X rank scaled by
+`PWC_TRENDING_X_WEIGHT` from `/etc/paperswithcode/trending-cron.env` (default 0
+= off, 1 = full lift).
+
+```bash
+uv run --env-file backend/keys.env python -m backend.scripts.refresh_x_post_likes --max-posts 20
+```
+
 `discover_x_threads.py` finds X posts in which authors introduce recent
 papers and links them to the paper page's "X threads" card. Twice a day it
 takes up to 40 arXiv papers from the last 10 days that are trending or featured
@@ -239,10 +257,23 @@ the most specific task, and one to three metrics; the backend validates and
 writes the rows, then requeues add-evals for the papers that reported the gap.
 Rejected candidates return for review once their paper count doubles; deferred
 ones after 14 days. Both kinds share the scheduler pause and run at most two at
-a time. Inspect or dry-run it with:
+a time.
+
+The same run then re-checks older papers against new leaderboards, however
+they were created (gap review, the add-benchmark skill, a sync, or by hand). For
+each dataset whose first `task_dataset_metrics` row is from the last two days,
+it reads the stored paper Markdown (else the abstract) of up to 50 of the
+newest papers already curated on that task before the board existed and with
+no row in the dataset's family, and queues add-evals (trigger
+`benchmark-promotion`, priority 50, policy `new-benchmark-<dataset id>`) for the
+papers that name it at least twice outside their references: at most 5 per
+benchmark and 20 per run, from at most 400 Markdown reads. The dispatcher runs
+at most two of these at once so daily curation keeps its workers. Inspect or
+dry-run it with:
 
 ```bash
 uv run --env-file backend/keys.env python -m backend.scripts.enqueue_benchmark_gap_review --status
+uv run --env-file backend/keys.env python -m backend.scripts.enqueue_benchmark_gap_review --dry-run
 ```
 
 `warm_paper_suggested_questions.py` pre-generates the three paper-page
@@ -258,17 +289,25 @@ uv run --env-file backend/keys.env python -m backend.scripts.warm_paper_suggeste
 ```
 
 `post_trending_paper_to_x.py` posts one trending paper to the Papers with
-Code X account (@paperswithcodee) every four hours. It takes the top
-`trending_score` arXiv paper from the last 14 days that has a TL;DR and was
-never posted, renders the first page of its PDF as an image, and posts the
-title, a blank line, and the Luna TL;DR with that image, then replies with the
-paper page link. `paper_x_posts` records each posted paper so none is posted
-twice. It needs the posting account's OAuth 1.0a keys in `production-cron.env`
-(`X_POST_CONSUMER_KEY`, `X_POST_CONSUMER_SECRET`, `X_POST_ACCESS_TOKEN`,
-`X_POST_ACCESS_TOKEN_SECRET`; the X app needs Read and Write permission) and
-only previews the post without them. Posts are capped at
+Code X account (@paperswithcodee) every eight hours (00:13, 08:13, 16:13 UTC).
+It takes the top five `trending_score` arXiv papers from the last 14 days that
+have a TL;DR and were never posted, prefers the first whose organization has a
+verified X account, renders the first page of its PDF as an image, and posts
+the paper's most striking concrete result, then its name and organization.
+An organization's handle is tagged only when it is verified: a linked X thread
+(reviewed as the paper's own) posted by an account named after the
+organization, or the single X link on the organization's Hugging Face page.
+Luna (`PWC_OPENAI_API_KEY`) writes the post from the title, TL;DR, abstract,
+and the paper's Papers with Code leaderboard results; it is kept only if it
+uses no number outside those facts and exactly the verified @mentions, else a
+template leads with the TL;DR sentence that states the most results. The
+paper page link follows as a reply. `paper_x_posts` records each posted paper
+so none is posted twice. It needs the posting account's OAuth 1.0a keys in
+`production-cron.env` (`X_POST_CONSUMER_KEY`, `X_POST_CONSUMER_SECRET`,
+`X_POST_ACCESS_TOKEN`, `X_POST_ACCESS_TOKEN_SECRET`; the X app needs Read and
+Write permission) and only previews the post without them. Posts are capped at
 `PWC_X_POST_MAX_CHARS` (default 280; raise it when the account has X Premium
-long posts), dropping trailing TL;DR sentences to fit. Preview the next post
+long posts). Preview the next post (`template` in the output is the fallback)
 with:
 
 ```bash

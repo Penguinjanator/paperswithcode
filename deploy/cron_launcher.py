@@ -41,6 +41,8 @@ RESTRICTED_TRENDING_PASSTHROUGH_KEYS = frozenset(
         "PWC_DB_PORT",
         "PWC_TRENDING_PIN_ARXIV_IDS",
         "PWC_TRENDING_PIN_PAPER_IDS",
+        "PWC_TRENDING_X_MIN_LIKES_PER_HOUR",
+        "PWC_TRENDING_X_WEIGHT",
         "TZ",
     }
 )
@@ -339,26 +341,6 @@ COMMANDS: dict[str, Job] = {
             "from the official API"
         ),
     ),
-    "sync_mmteb_retrieval": job(
-        "-m",
-        "scripts.hourly.sync_mmteb",
-        "retrieval",
-        timeout="30m",
-        idempotency=(
-            "replace arXiv-backed managed MMTEB v2 retrieval evaluation rows "
-            "from the official API"
-        ),
-    ),
-    "sync_mmteb_reranking": job(
-        "-m",
-        "scripts.hourly.sync_mmteb",
-        "reranking",
-        timeout="30m",
-        idempotency=(
-            "replace arXiv-backed managed MMTEB v2 reranking evaluation rows "
-            "from the official API"
-        ),
-    ),
     "sync_mmeb_v2": job(
         "-m",
         "scripts.hourly.sync_mmeb",
@@ -587,7 +569,8 @@ COMMANDS: dict[str, Job] = {
         timeout="30m",
         idempotency=(
             "queue at most one daily overseer review of eligible benchmark-gap "
-            "candidates and at most 40 add-benchmark jobs per UTC day"
+            "candidates and at most 40 add-benchmark jobs per UTC day, then at "
+            "most one add-evals re-check per paper and new benchmark (20 per run)"
         ),
     ),
     "scan_model_releases": job(
@@ -608,6 +591,15 @@ COMMANDS: dict[str, Job] = {
             "search X once per bounded candidate paper; link author posts only "
             "when PWC_X_THREAD_DISCOVERY_APPLY=true, through the audited x_threads "
             "section"
+        ),
+    ),
+    "refresh_x_post_likes": job(
+        "-m",
+        "backend.scripts.refresh_x_post_likes",
+        timeout="30m",
+        idempotency=(
+            "read each due post once per run and write only x_post_metrics; "
+            "report-only rolls back unless PWC_X_LIKES_APPLY=true"
         ),
     ),
     "post_trending_paper_to_x": job(
