@@ -318,6 +318,21 @@ TIMERS: tuple[TimerSpec, ...] = (
         description="Sync PatchEval-Verified leaderboard hourly",
     ),
     TimerSpec(
+        job="sync_critpt",
+        on_calendar=("*-*-* 00/2:52:00",),
+        description="Sync CritPt leaderboard from Artificial Analysis every two hours",
+    ),
+    TimerSpec(
+        job="sync_critpt_v2",
+        on_calendar=("*-*-* 01/2:52:00",),
+        description="Sync CritPt v2 leaderboard from Artificial Analysis every two hours",
+    ),
+    TimerSpec(
+        job="sync_terminal_bench_science",
+        on_calendar=("*-*-* 00/2:54:00",),
+        description="Sync Terminal-Bench-Science leaderboard from Artificial Analysis every two hours",
+    ),
+    TimerSpec(
         job="sync_physics_iq_verified",
         on_calendar=("*-*-* *:28:00",),
         description="Sync Physics-IQ Verified leaderboard hourly",

@@ -1614,6 +1614,116 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         dashboard_group="leaderboard_sync",
     ),
     CronJobDefinition(
+        id="sync_critpt",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(120, offset_minutes=52),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-critpt.timer",
+        systemd_service="pwc-cron-sync-critpt.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync CritPt Leaderboard (Artificial Analysis)",
+        category="hourly",
+        schedule="52 */2 * * * (every two hours)",
+        script_path="hourly/sync_critpt.py",
+        log_name="sync_critpt",
+        process_patterns=("scripts.hourly.sync_critpt",),
+        lock_file=("/var/lib/paperswithcode/production/cron-locks/sync_critpt.lock"),
+        expected_runtime_minutes=5,
+        stale_after_minutes=270,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '4 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'critpt'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code Artificial Analysis CritPt live sync.%'
+        """,
+        workflow_file="cron-sync-critpt.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_critpt_v2",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(120, offset_minutes=112),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-critpt-v2.timer",
+        systemd_service="pwc-cron-sync-critpt-v2.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync CritPt v2 Leaderboard (Artificial Analysis)",
+        category="hourly",
+        schedule="52 1-23/2 * * * (every two hours)",
+        script_path="hourly/sync_critpt_v2.py",
+        log_name="sync_critpt_v2",
+        process_patterns=("scripts.hourly.sync_critpt_v2",),
+        lock_file=("/var/lib/paperswithcode/production/cron-locks/sync_critpt_v2.lock"),
+        expected_runtime_minutes=5,
+        stale_after_minutes=270,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '4 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'critpt-v2'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code Artificial Analysis CritPt v2 live sync.%'
+        """,
+        workflow_file="cron-sync-critpt-v2.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_terminal_bench_science",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(120, offset_minutes=54),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-terminal-bench-science.timer",
+        systemd_service="pwc-cron-sync-terminal-bench-science.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync Terminal-Bench-Science Leaderboard (Artificial Analysis)",
+        category="hourly",
+        schedule="54 */2 * * * (every two hours)",
+        script_path="hourly/sync_terminal_bench_science.py",
+        log_name="sync_terminal_bench_science",
+        process_patterns=("scripts.hourly.sync_terminal_bench_science",),
+        lock_file=(
+            "/var/lib/paperswithcode/production/cron-locks/sync_terminal_bench_science.lock"
+        ),
+        expected_runtime_minutes=5,
+        stale_after_minutes=270,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '4 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'terminal-bench-science-0-1'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code Artificial Analysis Terminal-Bench-Science live sync.%'
+        """,
+        workflow_file="cron-sync-terminal-bench-science.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
         id="sync_frontiercode",
         scheduler="systemd",
         schedule_policies=(SchedulePolicy.fixed(60, offset_minutes=45),),
@@ -2121,8 +2231,9 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             "post_trending_paper_to_x.lock"
         ),
         expected_runtime_minutes=2,
-        # A run with nothing left to post writes no row, so allow a quiet day.
-        stale_after_minutes=1440,
+        # A run skips its slot when no paper is worth posting (no clear SOTA
+        # or well-known lab), which can last days, so allow a quiet week.
+        stale_after_minutes=10080,
         critical=False,
         healthy_no_work_allowed=True,
         db_freshness_query="""
