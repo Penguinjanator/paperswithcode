@@ -1493,9 +1493,9 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                    count(*) AS matched_evaluations
             FROM evaluations e
             JOIN datasets d ON d.id = e.dataset_id
-            WHERE d.slug = 'cwe-bench-v1'
+            WHERE d.slug = 'cwe-bench-v2'
               AND e.methodology LIKE
-                  'Managed by the Papers with Code Collinear AI CWE-bench live sync.%'
+                  'Managed by the Papers with Code Collinear AI CWE-bench v2 live sync.%'
         """,
         workflow_file="cron-sync-cwe-bench.yml",
         workflow_jobs=("run",),
@@ -2331,7 +2331,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         healthy_no_work_allowed=True,
         db_freshness_query="""
             WITH followed AS (
-              SELECT DISTINCT s.topic_id FROM research_subscriptions s
+              SELECT DISTINCT s.topic_id FROM research_topic_follows s
               JOIN research_topics t ON t.id = s.topic_id
               WHERE t.backfill_status = 'done'
             ), recent AS (
@@ -2351,11 +2351,11 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                    (SELECT extract(epoch FROM now() - min(t.created_at)) / 60
                     FROM research_topics t
                     WHERE t.backfill_status IN ('pending', 'running')
-                      AND t.id IN (SELECT topic_id FROM research_subscriptions))
+                      AND t.id IN (SELECT topic_id FROM research_topic_follows))
                        AS oldest_pending_backfill_minutes,
                    (SELECT count(*) FROM research_topics t
                     WHERE t.backfill_status = 'failed'
-                      AND t.id IN (SELECT topic_id FROM research_subscriptions))
+                      AND t.id IN (SELECT topic_id FROM research_topic_follows))
                        AS failed_backfills
         """,
         workflow_freshness_required=False,

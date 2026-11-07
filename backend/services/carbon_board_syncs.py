@@ -161,7 +161,9 @@ def parse_swe_sweep(html: str) -> list[LeaderboardEntry]:
 # --- Andon Labs: Vending-Bench 2 and Blueprint-Bench 2 ------------------------
 
 _SCRIPT_URL = re.compile(r'(?:href|src)="([^"]*/_app/immutable/[^"]+\.js)"')
-_VB2_RUNS = re.compile(r"(?<![\w$])vb2:\{")
+# Minified object literal before 2026-11-02, a JSON.parse string since.
+_VB2_RUNS = re.compile(r'(?<![\w$"])(?:vb2|"vb2"):\{')
+_NODE_IDS = re.compile(r"node_ids:\s*\[([\d,\s]+)\]")
 
 
 def parse_vending_bench_2(chunk: str) -> list[LeaderboardEntry]:
@@ -201,13 +203,28 @@ def fetch_vending_bench_2(client: httpx.Client | None = None) -> list[Leaderboar
     try:
         page = fetch_text(VENDING_BENCH_2_URL, active_client)
         seen: set[str] = set()
-        # Start from the page's route modules and follow their imports to
-        # the shared chunk that holds the run data.
-        queue = [
+        scripts = [
             httpx.URL(VENDING_BENCH_2_URL).join(url)
             for url in _SCRIPT_URL.findall(page)
-            if "/nodes/" in url
         ]
+        # Start from the page's route modules and follow their imports to
+        # the shared chunk that holds the run data.
+        queue = [url for url in scripts if "/nodes/" in url.path]
+        # Since 2026-11-02 the page preloads only its layout nodes; the
+        # route's own node is named by hydration's node_ids and resolved
+        # through the app entry's node table.
+        node_ids = _NODE_IDS.search(page)
+        app = next((url for url in scripts if "/entry/app." in url.path), None)
+        if node_ids and app is not None:
+            app_source = fetch_text(str(app), active_client)
+            for node_id in node_ids[1].replace(" ", "").split(","):
+                queue.extend(
+                    app.join(path)
+                    for path in re.findall(
+                        rf"[\"'`](\.\./nodes/{node_id}\.[\w-]+\.js)[\"'`]",
+                        app_source,
+                    )
+                )
         while queue and len(seen) < 150:
             url = queue.pop(0)
             if str(url) in seen:
@@ -323,12 +340,14 @@ def parse_riemann_bench(html: str) -> list[LeaderboardEntry]:
     return entries
 
 
-# --- Collinear AI: CWE-bench v1 ----------------------------------------------
+# --- Collinear AI: CWE-bench v2 ----------------------------------------------
 
-CWE_LIST_NAME = "CWE-bench v1 leaderboard"
+# v2 replaced v1 on 2026-11-02; v1 is a frozen archive at /v1 and its board
+# (cwe-bench-v1) is no longer synced.
+CWE_LIST_NAME = "CWE-bench v2 leaderboard"
 _CWE_DESCRIPTION = re.compile(
-    r"^Programmatic pass@1 (?P<pass1>\d+(?:\.\d+)?)%, "
-    r"pass@4 (?P<pass4>\d+(?:\.\d+)?%|not reported)\."
+    r"^pass@1 (?P<pass1>\d+(?:\.\d+)?)%, "
+    r"pass@4 (?P<pass4>\d+(?:\.\d+)?%|not reported) over 250 tasks;"
     r".*\brun in (?P<harness>[^.]+)\.$"
 )
 
@@ -361,7 +380,7 @@ def parse_cwe_bench(html: str) -> list[LeaderboardEntry]:
             LeaderboardEntry(
                 name,
                 float(pass1),
-                f"programmatic pass@1 {pass1}% (pass@4 {match['pass4']})",
+                f"pass@1 {pass1}% over all 250 tasks (pass@4 {match['pass4']})",
                 harness=match["harness"].strip(),
             )
         )
@@ -695,22 +714,22 @@ BOARD_SYNCS: dict[str, BoardSync] = {
                 # Its catalog paper was deleted; Chartography excludes it too.
                 "DeepSeek V4 Flash Vision (experimental)": "experimental variant without a release",
             },
-            protocol="25 private research-level problems with programmatic answer checks; agents have coding tools and web search.",
+            protocol="25 private research-level problems with programmatic answer checks (v1.1 answer keys); agents have coding tools and web search.",
         ),
         # Surge's Webflow host rejects non-browser user agents.
         _fetching(RIEMANN_BENCH_URL, parse_riemann_bench, SURGE_USER_AGENT),
     ),
     "sync_cwe_bench": BoardSync(
         LiveLeaderboard(
-            source="Collinear AI CWE-bench",
+            source="Collinear AI CWE-bench v2",
             provider="cwe-bench",
             url=CWE_BENCH_URL,
             task_slug="cybersecurity",
-            dataset_slug="cwe-bench-v1",
+            dataset_slug="cwe-bench-v2",
             metric="Pass@1",
-            identities=IDENTITIES["cwe-bench-v1"],
+            identities=IDENTITIES["cwe-bench-v2"],
             min_selected=5,
-            protocol="120 held-out audit-and-repair tasks; deterministic verifier pass@1 over four rollouts at high reasoning.",
+            protocol="250 audit-and-repair tasks (100 public, 150 held-out); deterministic verifier pass@1 over four one-hour rollouts at high reasoning.",
         ),
         _fetching(CWE_BENCH_URL, parse_cwe_bench),
     ),

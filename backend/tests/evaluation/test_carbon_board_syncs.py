@@ -117,6 +117,50 @@ def test_fetch_vending_bench_2_follows_imports_to_the_data_chunk():
     assert len(boards.fetch_vending_bench_2(client)) == 73
 
 
+def test_parse_vending_bench_2_reads_the_json_parse_chunk():
+    # Since 2026-11-02 the run data is a JSON.parse string with quoted keys,
+    # next to other runs (arena matches) that must be ignored.
+    chunk = _fixture("vending_bench_2_chunk_2026-11-06.js")
+    assert 'runs:JSON.parse(`{"vb2":{' in chunk
+    entries = _by_name(boards.parse_vending_bench_2(chunk))
+    assert len(entries) == 73
+    assert entries["Claude Fable 5 - High"].value == 5680.26
+    assert entries["Claude Fable 5 - High"].detail == (
+        "$5,680.26 mean final balance over 5 runs"
+    )
+
+
+def test_fetch_vending_bench_2_resolves_the_route_node_through_the_app_entry():
+    # The page preloads only layout nodes; node 26 is named by node_ids and
+    # the app entry's dynamic-import table.
+    pages = {
+        boards.VENDING_BENCH_2_URL: (
+            '<link href="../_app/immutable/entry/app.xyz.js">'
+            '<link href="../_app/immutable/nodes/0.abc.js">'
+            "<script>kit.start(app, element, {node_ids: [0, 3, 26], data: []});"
+            "</script>"
+        ),
+        "https://andonlabs.com/_app/immutable/entry/app.xyz.js": (
+            '["../nodes/2.aaa.js","../nodes/26.CKje-A28.js"],'
+            "()=>import(`../nodes/26.CKje-A28.js`),()=>import(`../nodes/3.q.js`)"
+        ),
+        "https://andonlabs.com/_app/immutable/nodes/0.abc.js": "export{};",
+        "https://andonlabs.com/_app/immutable/nodes/3.q.js": "export{};",
+        "https://andonlabs.com/_app/immutable/nodes/26.CKje-A28.js": (
+            'import{t as z}from"../chunks/3yXS6ZzI.js";let e=z.runs.vb2;'
+        ),
+        "https://andonlabs.com/_app/immutable/chunks/3yXS6ZzI.js": _fixture(
+            "vending_bench_2_chunk_2026-11-06.js"
+        ),
+    }
+
+    def handler(request):
+        return httpx.Response(200, text=pages[str(request.url)])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert len(boards.fetch_vending_bench_2(client)) == 73
+
+
 def test_parse_blueprint_bench_2_skips_human_and_floor_rows():
     entries = _by_name(
         boards.parse_blueprint_bench_2(_fixture("blueprint_bench_2.html"))
@@ -127,21 +171,29 @@ def test_parse_blueprint_bench_2_skips_human_and_floor_rows():
 
 
 def test_parse_riemann_bench_reads_visible_percentages():
+    # v1.1 (2026-11-02): answer keys changed for four problems and only the
+    # 21 current models were re-run.
     entries = _by_name(boards.parse_riemann_bench(_fixture("riemann_bench.html")))
-    assert len(entries) == 44
-    assert entries["GPT 5.6 Sol"].value == pytest.approx(74.4)
+    assert len(entries) == 21
+    assert entries["GPT 5.6 Sol"].value == pytest.approx(83.2)
     # "Hy" + "Hy4 Preview" names the model once.
     assert "Hy4 Preview" in entries
+    board = boards.BOARD_SYNCS["sync_riemann_bench"].board
+    assert "v1.1 answer keys" in board.protocol
+    reviewed = [name for name in entries if name in board.identities]
+    assert len(reviewed) == 21 >= board.min_selected
 
 
-def test_parse_cwe_bench_reads_the_json_ld_item_list():
+def test_parse_cwe_bench_reads_the_v2_json_ld_item_list():
     entries = _by_name(boards.parse_cwe_bench(_fixture("cwe_bench.html")))
-    assert len(entries) == 12
-    assert (entries["Gemini 4 Carbon"].value, entries["Gemini 4 Carbon"].harness) == (
-        71.0,
-        "Antigravity",
-    )
-    assert "pass@4 not reported" in entries["Inkling"].detail
+    assert len(entries) == 11
+    opus = entries["Claude Opus 5.5"]
+    assert (opus.value, opus.harness) == (67.1, "Claude Code")
+    assert opus.detail == "pass@1 67.1% over all 250 tasks (pass@4 79.2%)"
+    board = boards.BOARD_SYNCS["sync_cwe_bench"].board
+    # v2 has its own board; the v1 board stays a frozen snapshot.
+    assert board.dataset_slug == "cwe-bench-v2"
+    assert set(entries) == set(board.identities)
 
 
 def test_parse_exploitgym_keeps_only_six_hour_full_set_runs():
@@ -266,8 +318,8 @@ def test_parse_patcheval_verified_reads_the_readme_results_table():
         (
             boards.parse_cwe_bench,
             "cwe_bench.html",
-            "Programmatic pass@1 71%",
-            "pass@1 71%",
+            "pass@1 67.1%, pass@4 79.2% over 250 tasks",
+            "pass@1 67.1%, pass@4 79.2% over 100 tasks",
             "description changed",
         ),
         (
@@ -575,7 +627,7 @@ def test_riemann_fetch_sends_the_surge_browser_user_agent():
         return httpx.Response(200, text=_fixture("riemann_bench.html"))
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    assert len(boards.BOARD_SYNCS["sync_riemann_bench"].fetch(client)) == 44
+    assert len(boards.BOARD_SYNCS["sync_riemann_bench"].fetch(client)) == 21
     assert seen["agent"].startswith("Mozilla/5.0 (X11; Linux x86_64)")
 
 
