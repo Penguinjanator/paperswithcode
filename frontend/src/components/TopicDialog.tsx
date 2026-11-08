@@ -10,7 +10,7 @@ import { useAuth } from '@/lib/authContext';
 import { displayTaskName } from '@/lib/transform';
 import { TEN_MINUTES } from '@/lib/api/queryKeys';
 import {
-  stashPendingFollows, stashPendingTopic, useRemoveTopics, useResearchFollows, useResearchTopics, useSaveFollows, useSaveTopic,
+  stashPendingFollows, stashPendingTopic, topicTitle, useRemoveTopics, useResearchFollows, useResearchTopics, useSaveFollows, useSaveTopic,
   type FollowPick,
 } from '@/lib/researchTopic';
 
@@ -150,7 +150,7 @@ function TopicDialogForm({ topicId, onDone }: { topicId: number | null; onDone: 
       </label></h3>
       <p className="topic-dialog-hint">
         {atLimit ? `You follow ${TOPIC_LIMIT} topics, the most allowed. Remove one below to add another.`
-          : 'A model reads every new paper and adds the ones that match to your Following feed.'}
+          : 'A model reads every new paper and adds the ones that match to your Following feed. New topics are public and show your Hugging Face username; make one private in Settings.'}
       </p>
       <textarea id="topic-dialog-input" className="research-topic-input" rows={4} maxLength={TOPIC_MAX_LENGTH}
         aria-label="Research topic"
@@ -173,7 +173,7 @@ function TopicDialogForm({ topicId, onDone }: { topicId: number | null; onDone: 
             title={topic.text}
             onClick={() => setRemovals(current => on ? [...current, topic.id] : current.filter(id => id !== topic.id))}>
             {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
-            {topic.label ?? topic.text}
+            {topicTitle(topic)}
           </button>;
         })}
       </div>
