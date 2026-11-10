@@ -1,5 +1,5 @@
 import ResearchFollowButton from "@/components/ResearchFollowButton";
-import { paperQueryKeys } from "@/lib/paperQueryKeys";
+
 import React, { useMemo } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -9,58 +9,44 @@ import { MethodFigure } from "@/components/MethodFigure";
 import { PaperFeedList, PaperFeedToolbar } from "@/components/PaperFeed";
 import MethodUsageChart from "@/components/MethodUsageChart";
 import MarkdownText from "@/components/MarkdownText";
-import { catalogApi } from "@/lib/api/catalog";
 import { papersApi } from "@/lib/api/papers";
-import { isNotFound } from "@/lib/apiErrors";
 import { slugify } from "@/lib/slug";
 import { transformPaperForCard } from "@/lib/transform";
 import { usePaperFeedParams } from "@/hooks/usePaperFeedParams";
 import { usePaperFeedQuery } from "@/hooks/usePapers";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { resolveInternalPath } from "@/lib/internalLinks";
 import { safeExternalHref } from "@/lib/safeExternalHref";
 import NotFound from "@/pages/NotFound";
-import { catalogQueryKeys, TEN_MINUTES } from "@/lib/api/queryKeys";
+import { loadFailurePage } from "@/components/LoadFailurePage";
+import { catalogQueries, paperFeedKeys } from "@/lib/api/queries";
+
+/** Methods whose figure is a wide diagram that needs more of the hero than a portrait card. */
+const WIDE_FIGURE_METHODS: ReadonlySet<string | undefined> = new Set([
+  "grokking",
+  "latent-reasoning",
+  "world-action-models",
+  "continuous-language-model",
+]);
 
 const MethodDetailView: React.FC = () => {
   const { methodSlug } = useParams<{ methodSlug: string }>();
   const feed = usePaperFeedParams({ defaultToLastMonth: true });
 
-  const methodQ = useQuery({
-    queryKey: catalogQueryKeys.method(methodSlug),
-    queryFn: () => catalogApi.getMethod(methodSlug!),
-    enabled: !!methodSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const methodQ = useQuery(catalogQueries.method(methodSlug));
 
-  const areasQ = useQuery({
-    queryKey: catalogQueryKeys.areas,
-    queryFn: () => catalogApi.listAreas({ page_size: 50, ordering: "name" }),
-    enabled: !!methodQ.data?.area_id,
-    staleTime: TEN_MINUTES,
-  });
+  const areasQ = useQuery({ ...catalogQueries.areas(), enabled: !!methodQ.data?.area_id });
 
-  const trendQ = useQuery({
-    queryKey: ["method-trend", methodSlug],
-    queryFn: () => catalogApi.methodTrend(methodSlug!),
-    enabled: !!methodSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const trendQ = useQuery(catalogQueries.methodTrend(methodSlug));
 
   const papersQ = usePaperFeedQuery(
-    [...paperQueryKeys.feeds.method, methodSlug, feed.filters],
+    paperFeedKeys.method(methodSlug, feed.filters),
     // Cards show only the leading repository.
     (page) => papersApi.forMethod(methodSlug!, { ...feed.filters, page, page_size: 20, repository_limit: 1 }),
     { enabled: !!methodSlug },
   );
 
-  const relatedQ = useQuery({
-    queryKey: ["related-methods", methodSlug],
-    queryFn: () => catalogApi.relatedMethods(methodSlug!),
-    enabled: !!methodSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const relatedQ = useQuery(catalogQueries.relatedMethods(methodSlug));
 
   const cards = useMemo(
     () => papersQ.data?.pages.flatMap((page) => page.results.map(transformPaperForCard)) ?? [],
@@ -76,15 +62,8 @@ const MethodDetailView: React.FC = () => {
     );
   }
 
-  if (isNotFound(methodQ.error)) return <NotFound />;
-  if (methodQ.error || !methodQ.data) {
-    return (
-      <div className="page">
-        <Alert variant="destructive">
-          <AlertDescription>Method not found.</AlertDescription>
-        </Alert>
-      </div>
-    );
+  if (!methodQ.data) {
+    return loadFailurePage([methodQ.error], "Failed to load this method. Please try again.") ?? <NotFound />;
   }
 
   const m = methodQ.data;
@@ -107,13 +86,7 @@ const MethodDetailView: React.FC = () => {
       </div>
 
       <div
-        className={`tag-hero method-hero-grid${
-          m.slug === "grokking" ||
-          m.slug === "latent-reasoning" ||
-          m.slug === "world-action-models"
-            ? " method-hero-grid--wide-figure"
-            : ""
-        }`}
+        className={`tag-hero method-hero-grid${WIDE_FIGURE_METHODS.has(m.slug) ? " method-hero-grid--wide-figure" : ""}`}
       >
         <div>
           <div className="tag-hero-eyebrow">METHOD</div>

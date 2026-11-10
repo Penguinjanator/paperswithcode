@@ -107,7 +107,7 @@ IDENTITIES: dict[str, dict[str, ModelIdentity]] = {
         ),
         "Beam 1.0": ModelIdentity(
             "Beam 1.0",
-            source_url="https://reflection.ai/blog/introducing-beam",
+            source_url="https://reflection.ai/documents/beam-model-tech-report.pdf",
             is_open=True,
         ),
         "Inkling": ModelIdentity(
@@ -664,7 +664,7 @@ IDENTITIES: dict[str, dict[str, ModelIdentity]] = {
         ),
         "Beam 1.0": ModelIdentity(
             "Beam 1.0",
-            source_url="https://reflection.ai/blog/introducing-beam",
+            source_url="https://reflection.ai/documents/beam-model-tech-report.pdf",
             is_open=True,
         ),
         "Mistral Large 4": ModelIdentity(
@@ -988,7 +988,9 @@ IDENTITIES: dict[str, dict[str, ModelIdentity]] = {
             is_open=True,
         ),
         "Kimi K3.1 Pro": ModelIdentity(
-            "Kimi K3.1 Pro", source_url="https://www.kimi.com/blog/kimi-k3-1-pro"
+            "Kimi K3.1 Pro",
+            source_url="https://www.kimi.com/blog/kimi-k3-1-pro",
+            is_open=True,
         ),
         "MiMo-V2.6-Pro": ModelIdentity(
             "MiMo-V2.6-Pro", arxiv_id="2610.11959", is_open=True
@@ -1027,7 +1029,7 @@ IDENTITIES: dict[str, dict[str, ModelIdentity]] = {
     "critpt-v2": {
         "Beam 1.0": ModelIdentity(
             "Beam 1.0",
-            source_url="https://reflection.ai/blog/introducing-beam",
+            source_url="https://reflection.ai/documents/beam-model-tech-report.pdf",
             is_open=True,
         ),
         "Claude Fable 5.1 (max)": ModelIdentity(
@@ -1084,7 +1086,9 @@ IDENTITIES: dict[str, dict[str, ModelIdentity]] = {
             "K2 Horizon 375B A23B", source_url="https://ifm.ai/blog/k2/", is_open=True
         ),
         "Kimi K3.1 Pro": ModelIdentity(
-            "Kimi K3.1 Pro", source_url="https://www.kimi.com/blog/kimi-k3-1-pro"
+            "Kimi K3.1 Pro",
+            source_url="https://www.kimi.com/blog/kimi-k3-1-pro",
+            is_open=True,
         ),
         "MiMo-V2.6-Pro": ModelIdentity(
             "MiMo-V2.6-Pro", arxiv_id="2610.11959", is_open=True

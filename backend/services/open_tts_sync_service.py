@@ -15,12 +15,8 @@ from gradio_client import Client
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
     PaperTask,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.artificial_analysis_sync_service import (
     ArtificialAnalysisDiscovery,
@@ -28,6 +24,14 @@ from backend.services.artificial_analysis_sync_service import (
     PaperIdentity,
 )
 from backend.services.evaluation_service import EvaluationService
+from backend.services.leaderboard_model_matching_service import (
+    LeaderboardModel,
+    LeaderboardModelMatcher,
+    MatchedModel,
+)
+from backend.services.leaderboard_sync_catalog import (
+    resolve_leaderboard,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
 
 SPACE_APP_URL = "https://hf-audio-open-tts-leaderboard.hf.space"
@@ -141,6 +145,7 @@ class OpenTtsSyncStats:
     created: int = 0
     updated: int = 0
     deleted: int = 0
+    auto_matched: list[str] = field(default_factory=list)
     excluded_models: list[str] = field(default_factory=list)
     missing_papers: list[str] = field(default_factory=list)
 
@@ -240,8 +245,7 @@ def parse_open_tts_leaderboard(
         )
 
     indexes = {name: headers.index(name) for name in required}
-    entries: list[OpenTtsEntry] = []
-    model_ids: set[str] = set()
+    entries_by_model: dict[str, OpenTtsEntry] = {}
     ranks: set[int] = set()
     for row in rows:
         if not isinstance(row, list) or len(row) != len(headers):
@@ -269,30 +273,32 @@ def parse_open_tts_leaderboard(
             or not 0 < rtfx < 1_000_000
         ):
             raise ValueError(f"Open TTS row is outside accepted bounds for {model_id}")
-        key = model_id.casefold()
-        if key in model_ids or rank in ranks:
-            raise ValueError("Open TTS response contains duplicate models or ranks")
-        model_ids.add(key)
+        if rank in ranks:
+            raise ValueError("Open TTS response contains duplicate ranks")
         ranks.add(rank)
         license_name = html.unescape(
             _TAG_RE.sub("", str(row[indexes["License"]]))
         ).strip()
-        entries.append(
-            OpenTtsEntry(
-                model_id=model_id,
-                model_name=model_name,
-                rank=rank,
-                wer=wer,
-                rtfx=rtfx,
-                is_open=license_name.casefold() not in {"proprietary", "closed"},
-            )
+        entry = OpenTtsEntry(
+            model_id=model_id,
+            model_name=model_name,
+            rank=rank,
+            wer=wer,
+            rtfx=rtfx,
+            is_open=license_name.casefold() not in {"proprietary", "closed"},
         )
-    if len(entries) < min_ranked_entries:
+        # Upstream can list one model twice under different voices; keep
+        # its best-ranked row.
+        key = model_id.casefold()
+        if key not in entries_by_model or rank < entries_by_model[key].rank:
+            entries_by_model[key] = entry
+    entries = list(entries_by_model.values())
+    if len(ranks) < min_ranked_entries:
         raise ValueError(
-            f"Open TTS returned {len(entries)} ranked rows; expected at least "
+            f"Open TTS returned {len(ranks)} ranked rows; expected at least "
             f"{min_ranked_entries}"
         )
-    if ranks != set(range(1, len(entries) + 1)):
+    if ranks != set(range(1, len(ranks) + 1)):
         raise ValueError("Open TTS ranks must be contiguous and start at one")
     return sorted(entries, key=lambda entry: entry.rank)
 
@@ -367,54 +373,19 @@ class OpenTtsSyncService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _leaderboard_identity(self, dataset_slug: str) -> tuple[Task, Dataset]:
-        task = self.db.query(Task).filter(Task.slug == TASK_SLUG).one_or_none()
-        dataset = (
-            self.db.query(Dataset).filter(Dataset.slug == dataset_slug).one_or_none()
-        )
-        metrics = {
-            metric.name: metric
-            for metric in self.db.query(Metric)
-            .filter(Metric.name.in_((WER_METRIC, RTFX_METRIC)))
-            .all()
-        }
-        if (
-            task is None
-            or dataset is None
-            or set(metrics)
-            != {
-                WER_METRIC,
-                RTFX_METRIC,
-            }
-        ):
-            raise RuntimeError(
-                "Open TTS task, benchmark, or metrics are not configured"
-            )
-        configured = {
-            row.metric_id
-            for row in self.db.query(TaskDatasetMetric)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-            )
-            .all()
-        }
-        if {metric.id for metric in metrics.values()} - configured:
-            raise RuntimeError(
-                "Open TTS leaderboard metrics are not linked to the task"
-            )
-        return task, dataset
-
     def _sync_dataset(
         self,
         entries: list[OpenTtsEntry],
         *,
         dataset_slug: str,
         discovery: ArtificialAnalysisDiscovery,
+        auto_matched: dict[str, MatchedModel],
         now: datetime,
     ) -> OpenTtsSyncStats:
         stats = OpenTtsSyncStats(fetched=len(entries))
-        task, dataset = self._leaderboard_identity(dataset_slug)
+        task, dataset = resolve_leaderboard(
+            self.db, "Open TTS", TASK_SLUG, dataset_slug, (WER_METRIC, RTFX_METRIC)
+        )
         candidate_rows = (
             self.db.query(Evaluation)
             .filter(
@@ -445,12 +416,16 @@ class OpenTtsSyncService:
         }
         for entry in entries:
             key = entry.model_id.casefold()
-            if key not in reviewed_ids:
+            if key in reviewed_ids:
+                paper_id = discovery.papers.get(entry.model_id)
+                if paper_id is None:
+                    stats.missing_papers.append(entry.model_id)
+                    continue
+            elif (match := auto_matched.get(entry.model_name)) is not None:
+                paper_id = match.paper_id
+                stats.auto_matched.append(entry.model_id)
+            else:
                 stats.excluded_models.append(entry.model_id)
-                continue
-            paper_id = discovery.papers.get(entry.model_id)
-            if paper_id is None:
-                stats.missing_papers.append(entry.model_id)
                 continue
             selected_ids.add(key)
             row = managed_by_id.get(key)
@@ -516,15 +491,39 @@ class OpenTtsSyncService:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         try:
+            # Models outside the reviewed catalog go to the shared matcher
+            # once for both views; the rest become release-radar signals.
+            reviewed_ids = {model_id.casefold() for model_id in MODEL_PAPER_IDENTITIES}
+            unknown = list(
+                {
+                    entry.model_id.casefold(): LeaderboardModel(
+                        entry.model_name, entry.model_id.split("/", 1)[0]
+                    )
+                    for entries in leaderboards.values()
+                    for entry in entries
+                    if entry.model_id.casefold() not in reviewed_ids
+                }.values()
+            )
+            matcher = LeaderboardModelMatcher(
+                self.db,
+                provider="open-tts",
+                leaderboard_name="Open TTS",
+                leaderboard_url=SPACE_SOURCE_URL,
+            )
+            auto_matched = matcher.match(unknown)
             stats = {
                 dataset_slug: self._sync_dataset(
                     entries,
                     dataset_slug=dataset_slug,
                     discovery=discovery,
+                    auto_matched=auto_matched,
                     now=now,
                 )
                 for dataset_slug, entries in leaderboards.items()
             }
+            matcher.report_unmatched(
+                [model for model in unknown if model.name not in auto_matched]
+            )
             if commit:
                 self.db.commit()
             else:

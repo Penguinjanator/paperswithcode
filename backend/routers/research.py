@@ -3,6 +3,7 @@
 from datetime import date, datetime, timezone
 import binascii
 import json
+import re
 from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
@@ -23,6 +24,7 @@ from backend.models.research import (
     SubscriptionView,
     TopicBubble,
     TopicOrderUpdate,
+    TopicSuggestion,
     TopicUpdate,
     TopicView,
     TopicVisibilityUpdate,
@@ -89,9 +91,17 @@ def _save_topic(
     db: Session, request: Request, subject: str, body: TopicUpdate, replace: int | None
 ) -> TopicView:
     now = datetime.now(timezone.utc)
+    text = _topic_text(body)
+    # A topic named like a catalog task, method or benchmark duplicates following it.
+    matches = research_topic_service.suggestions(db, text)
+    if matches:
+        raise HTTPException(
+            409,
+            f"“{text}” is already a {matches[0].kind}; follow {matches[0].name} instead",
+        )
     try:
         topic_id = research_topic_service.follow_topic(
-            db, subject, _topic_text(body), now, replace=replace
+            db, subject, text, now, replace=replace
         )
     except LookupError as exc:
         raise HTTPException(404, "Topic not found") from exc
@@ -213,6 +223,17 @@ def viewer_subject(request: Request) -> str | None:
     return subject.strip() if isinstance(subject, str) and subject.strip() else None
 
 
+@router.get("/research/topic-matches", response_model=list[TopicSuggestion])
+def topic_matches(
+    response: Response,
+    text: str = Query(..., max_length=300),
+    db: Session = Depends(get_database_session),
+):
+    """Catalog tasks, methods and benchmarks a topic with this text would duplicate."""
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return research_topic_service.suggestions(db, text)
+
+
 # Declared before /research/topics/{topic_id} so "featured" is not read as an id.
 @router.get("/research/topics/featured", response_model=list[TopicBubble])
 def featured_topics(response: Response, db: Session = Depends(get_database_session)):
@@ -306,7 +327,16 @@ def following(
         False, description="Only papers with Hugging Face artifacts"
     ),
     topic_only: bool = Query(False, description="Only papers matching a topic"),
-    topic_id: int | None = Query(None, description="Only papers matching this topic"),
+    topic_id: list[int] = Query(
+        [], description="Only papers matching any of these topics; repeat to add more"
+    ),
+    follow: list[str] = Query(
+        [],
+        description=(
+            "Only papers matching any of these follows, as <kind>:<entity_id>; "
+            "repeat to add more. Combines with topic_id as either-or."
+        ),
+    ),
     user: dict = Depends(require_user),
     db: Session = Depends(get_database_session),
 ):
@@ -325,8 +355,19 @@ def following(
         has_code=has_code,
         has_hf_artifacts=has_hf_artifacts,
         topic_only=topic_only,
-        topic_id=topic_id,
+        topic_ids=topic_id,
+        follows=[parse_follow(value) for value in follow],
     )
+
+
+FOLLOW_FILTER = re.compile(r"(task|method|benchmark|author|organization):([0-9]+)")
+
+
+def parse_follow(value: str) -> tuple[str, int]:
+    match = FOLLOW_FILTER.fullmatch(value)
+    if match is None:
+        raise HTTPException(422, "follow must look like <kind>:<entity_id>")
+    return match[1], int(match[2])
 
 
 def verified_email(request: Request) -> str | None:

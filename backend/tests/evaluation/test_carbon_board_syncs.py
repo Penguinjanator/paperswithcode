@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -30,6 +31,11 @@ from backend.models.database import (
 )
 from backend.services import carbon_board_syncs as boards
 from backend.services.carbon_board_identities import IDENTITIES
+from backend.services.leaderboard_model_matching_service import (
+    family_lab,
+    link_owner,
+    vendor_label_model,
+)
 from backend.services.live_leaderboard_sync import (
     LeaderboardEntry,
     LiveLeaderboard,
@@ -387,10 +393,13 @@ def test_every_board_has_identities_and_a_configured_fetcher():
         "sync_critpt",
         "sync_critpt_v2",
         "sync_terminal_bench_science",
+        "sync_vals_finance_agent",
+        "sync_surge_chartography",
     }
-    for sync in boards.BOARD_SYNCS.values():
+    for job, sync in boards.BOARD_SYNCS.items():
         assert len(sync.board.identities) >= sync.board.min_selected
-        assert sync.board.identities is IDENTITIES[sync.board.dataset_slug]
+        if job not in ("sync_vals_finance_agent", "sync_surge_chartography"):
+            assert sync.board.identities is IDENTITIES[sync.board.dataset_slug]
 
 
 # --- Engine -------------------------------------------------------------------
@@ -497,6 +506,7 @@ def test_sync_creates_rows_keeping_each_models_best_setting():
         'Official leaderboard entry "Sol 5.6 (xhigh) (mini-SWE-agent)"'
     )
     assert sol.best_rank == 1 and sol.external is True
+    assert sol.evaluated_on == datetime.now(UTC).date()
     assert (stats.created, stats.matched) == (2, 2)
 
 
@@ -524,6 +534,11 @@ def test_sync_adopts_a_hand_imported_row_and_its_unreported_harness():
     )
     assert (hand.harness, hand.metrics) == ("mini-SWE-agent", {METRIC: 3.61})
     assert hand.source_url == "https://example.com/board"
+    # The hand-written methodology stays as reviewer notes beneath the head.
+    assert hand.methodology.endswith(
+        "listed at https://example.com/board. Test protocol. "
+        "Hand import from the system card."
+    )
 
     # A second run only reports unchanged managed rows.
     again = LiveLeaderboardSyncService(session, _board()).sync(
@@ -597,9 +612,42 @@ def test_sync_reports_unknown_models_to_the_release_radar():
     assert session.query(ModelReleaseSignal).count() == 1
 
 
+def test_bare_model_names_reach_the_radar_with_their_family_lab():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [
+            _entry("Opus 5.5 (xhigh)", 3.61),
+            _entry("Sol 5.6 (xhigh)", 4.7),
+            LeaderboardEntry("Claude Mythos 6", 2.0, "2.0% resolved", "mini-SWE-agent"),
+            LeaderboardEntry("Mystery 9", 1.0, "1.0% resolved", "mini-SWE-agent"),
+        ]
+    )
+    signals = session.query(ModelReleaseSignal).all()
+    assert [(s.lab, s.model_name) for s in signals] == [
+        ("Anthropic", "Claude Mythos 6")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "lab"),
+    [
+        ("GPT-6.2 Terra", "OpenAI"),
+        ("o5-mini", "OpenAI"),
+        ("Gemini 4.1 Pro", "Google DeepMind"),
+        ("Qwen3.9-Max", "Alibaba"),
+        ("Kimi K4", "Moonshot AI"),
+        ("Nova 2", ""),
+        ("Opus 5.5", "Anthropic"),
+        ("Sol 5.6", ""),
+    ],
+)
+def test_family_lab(name, lab):
+    assert family_lab(name) == lab
+
+
 def test_sync_refuses_a_collapsed_board_without_writing():
     session = _session()
-    with pytest.raises(RuntimeError, match="only 1 reviewed entries"):
+    with pytest.raises(RuntimeError, match="only 1 reviewed models"):
         LiveLeaderboardSyncService(session, _board()).sync(
             [_entry("Opus 5.5 (xhigh)", 3.61)]
         )
@@ -673,3 +721,106 @@ def test_vals_index_maps_the_open_mistral_large_4_release():
     assert IDENTITIES["vals-index-v2-2"]["Mercury 3"].source_url == (
         "https://www.inceptionlabs.ai/blog/introducing-mercury-3"
     )
+
+
+@pytest.mark.parametrize(
+    ("label", "lab", "expected"),
+    [
+        ("OpenAI GPT-6.1 Sol (Reasoning Low)", "", ("GPT-6.1 Sol", "OpenAI")),
+        (
+            "Google Gemini 3.7 Flash (Thinking High)",
+            "",
+            ("Gemini 3.7 Flash", "Google DeepMind"),
+        ),
+        ("Qwen3.8 27B", "", ("Qwen3.8 27B", "Alibaba")),
+        ("NovaOCR-3", "nova-lab", ("NovaOCR-3", "nova-lab")),
+        ("Google Veo-Doc 2", "", ("Veo-Doc 2", "Google")),
+    ],
+)
+def test_vendor_label_model(label, lab, expected):
+    model = vendor_label_model(label, lab)
+    assert (model.name, model.lab) == expected
+
+
+def test_sync_keeps_reviewer_notes_and_other_metrics_of_managed_rows():
+    session = _session()
+    service = LiveLeaderboardSyncService(session, _board())
+    entries = [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    service.sync(entries)
+    opus = _rows(session)["Claude Opus 5.5 (mini-SWE-agent)"]
+    opus.methodology += " Reviewed against the paper."
+    opus.metrics = {**opus.metrics, "Cost ($)": 12.0}
+    session.commit()
+
+    unchanged = service.sync(entries)
+    assert unchanged.changed == 0
+    revised = service.sync([_entry("Opus 5.5 (xhigh)", 3.9), entries[1]])
+    assert revised.changed == 1
+    assert opus.metrics == {METRIC: 3.9, "Cost ($)": 12.0}
+    assert opus.methodology.endswith(
+        "3.9% resolved, listed at https://example.com/board. Test protocol. "
+        "Reviewed against the paper."
+    )
+
+
+def test_sync_appends_the_board_model_name_suffix():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board(model_name_suffix=" (no tools)")).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    assert set(_rows(session)) == {
+        "Claude Opus 5.5 (no tools) (mini-SWE-agent)",
+        "GPT-5.6 Sol (no tools) (mini-SWE-agent)",
+    }
+
+
+@pytest.mark.parametrize(
+    ("url", "owner"),
+    [
+        ("https://huggingface.co/nvidia/Kumo", "nvidia"),
+        ("https://huggingface.co/blog/nvidia/kumo-tabular", "nvidia"),
+        ("https://huggingface.co/spaces/nvidia/kumo-demo", "nvidia"),
+        ("https://huggingface.co/datasets/nvidia/kumo-data", "nvidia"),
+        ("https://huggingface.co/papers/2611.01234", ""),
+        ("https://github.com/layer6ai-labs/TabDPT-inference/releases", "layer6ai-labs"),
+        ("https://scikit-learn.org/stable/modules/neighbors.html", None),
+    ],
+)
+def test_link_owner(url, owner):
+    assert link_owner(url) == owner
+
+
+def test_sync_keeps_an_unrounded_score_at_the_published_precision():
+    session = _session()
+    service = LiveLeaderboardSyncService(session, _board())
+    sol = [_entry("Sol 5.6 (xhigh)", 4.7)]
+    service.sync([_entry("Opus 5.5 (xhigh)", 3.61), *sol])
+    opus = _rows(session)["Claude Opus 5.5 (mini-SWE-agent)"]
+    opus.metrics = {METRIC: 3.614}
+    session.commit()
+
+    # 3.614 is 3.61 at the board's two decimals: kept, not a revision.
+    listed = LeaderboardEntry(
+        "Opus 5.5 (xhigh)", Decimal("3.61"), "3.61% resolved", "mini-SWE-agent"
+    )
+    assert service.sync([listed, *sol]).changed == 0
+    assert opus.metrics == {METRIC: 3.614}
+    # A trailing zero is still precision: 3.614 is not 3.60.
+    revised = LeaderboardEntry(
+        "Opus 5.5 (xhigh)", Decimal("3.60"), "3.60% resolved", "mini-SWE-agent"
+    )
+    assert service.sync([revised, *sol]).changed == 1
+    assert opus.metrics == {METRIC: 3.6}
+
+
+def test_collapse_floor_counts_distinct_models_not_labels():
+    session = _session()
+    # Two labels name GPT-5.6 Sol, so three labels are only two models.
+    board = _board(min_selected=3)
+    entries = [
+        _entry("Opus 5.5 (xhigh)", 3.61),
+        _entry("Sol 5.6 (high)", 3.1),
+        _entry("Sol 5.6 (xhigh)", 4.7),
+    ]
+    with pytest.raises(RuntimeError, match="only 2 reviewed models"):
+        LiveLeaderboardSyncService(session, board).sync(entries)

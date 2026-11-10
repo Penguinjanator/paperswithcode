@@ -5,6 +5,10 @@ and declares a reviewed ``ModelIdentity`` map; this engine resolves papers,
 hands unreviewed names to the release radar, and creates or revises the rows
 it owns. Like every live sync it never creates papers and never deletes rows:
 a managed row that leaves the upstream board is only reported.
+
+A managed methodology is the sync's head followed by any reviewer notes. The
+engine rewrites the head on every run and keeps the notes; adopting a
+hand-imported row keeps its methodology as the notes.
 """
 
 from __future__ import annotations
@@ -13,46 +17,28 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 import httpx
-
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
-    Dataset,
     Evaluation,
-    Metric,
-    Paper,
     PaperTask,
-    Task,
-    TaskDatasetMetric,
 )
 from backend.services.evaluation_service import EvaluationService
 from backend.services.leaderboard_model_matching_service import (
     LeaderboardModel,
     LeaderboardModelMatcher,
 )
+from backend.services.leaderboard_sync_catalog import (
+    ModelIdentity,
+    resolve_identity_papers,
+    resolve_leaderboard,
+    score_matches,
+)
 from backend.services.leaderboard_sync_ownership import managed_methodology_prefix
-
-
-@dataclass(frozen=True)
-class ModelIdentity:
-    """A reviewed leaderboard model and the paper that introduces it."""
-
-    model_name: str
-    arxiv_id: str | None = None
-    source_url: str | None = None
-    is_open: bool = False
-    hf_model_url: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.arxiv_id is None) == (self.source_url is None):
-            raise ValueError("ModelIdentity requires exactly one paper identity")
-
-    @property
-    def paper_key(self) -> str:
-        return self.arxiv_id or self.source_url or ""
 
 
 @dataclass(frozen=True)
@@ -60,10 +46,15 @@ class LeaderboardEntry:
     """One official leaderboard row, already on the board's metric scale."""
 
     name: str
-    value: float
+    # A Decimal keeps the precision the board publishes (65.40, not 65.4).
+    value: float | Decimal
     detail: str
     harness: str | None = None
     lab: str = ""
+    # Where this entry's result is reported, when not the board page itself.
+    source_url: str | None = None
+    # When the board added this entry; otherwise the day the sync creates it.
+    evaluated_on: date | None = None
 
     @property
     def label(self) -> str:
@@ -72,7 +63,12 @@ class LeaderboardEntry:
 
 @dataclass(frozen=True)
 class LiveLeaderboard:
-    """Static configuration of one synced board."""
+    """Static configuration of one synced board.
+
+    Several boards may share a benchmark when each publishes its own metric
+    (Physics-IQ Verified's I2V and V2V tracks): a board only reads and writes
+    rows that carry its metric.
+    """
 
     source: str
     provider: str
@@ -82,7 +78,10 @@ class LiveLeaderboard:
     metric: str
     identities: dict[str, ModelIdentity]
     min_selected: int
-    protocol: str
+    # Board-wide evaluation setup appended to every managed head.
+    protocol: str = ""
+    # Appended to every catalog model name on the board, e.g. " (no tools)".
+    model_name_suffix: str = ""
     # Upstream names the board deliberately leaves out, with the reason.
     excluded: dict[str, str] = field(default_factory=dict)
     # Whether a hand-imported row for the same paper and model name becomes
@@ -93,6 +92,17 @@ class LiveLeaderboard:
     @property
     def managed_prefix(self) -> str:
         return managed_methodology_prefix(self.source)
+
+    @property
+    def managed_head(self) -> re.Pattern[str]:
+        """Match a managed methodology, capturing the reviewer notes after it."""
+        protocol = f" {re.escape(self.protocol)}" if self.protocol else ""
+        return re.compile(
+            f"{re.escape(self.managed_prefix)} Official leaderboard entry "
+            # Physics-IQ Verified heads before 2026-11-09 end "reported at".
+            rf".*?, (?:listed|reported) at \S+\.{protocol}(?: (?P<notes>.*))?$",
+            re.DOTALL,
+        )
 
 
 @dataclass
@@ -199,78 +209,56 @@ class LiveLeaderboardSyncService:
         self.db = db
         self.board = board
 
-    def _leaderboard_identity(self) -> tuple[Task, Dataset]:
+    def _methodology(self, entry: LeaderboardEntry, notes: str) -> str:
         board = self.board
-        task = self.db.query(Task).filter(Task.slug == board.task_slug).one_or_none()
-        dataset = (
-            self.db.query(Dataset)
-            .filter(Dataset.slug == board.dataset_slug)
-            .one_or_none()
-        )
-        if task is None or dataset is None:
-            raise RuntimeError(f"{board.source} task or benchmark is not configured")
-        configured = (
-            self.db.query(TaskDatasetMetric)
-            .join(Metric, Metric.id == TaskDatasetMetric.metric_id)
-            .filter(
-                TaskDatasetMetric.task_id == task.id,
-                TaskDatasetMetric.dataset_id == dataset.id,
-                Metric.name == board.metric,
-            )
-            .count()
-        )
-        if configured != 1:
-            raise RuntimeError(f"{board.source} metric is not linked to the task")
-        return task, dataset
-
-    def _paper_ids(self) -> dict[str, int]:
-        """Resolve reviewed paper identities without ever creating papers."""
-        identities = self.board.identities.values()
-        arxiv_ids = {i.arxiv_id for i in identities if i.arxiv_id}
-        source_urls = {i.source_url for i in identities if i.source_url}
-        papers = (
-            self.db.query(Paper.id, Paper.arxiv_id, Paper.source_url)
-            .filter(
-                Paper.is_latest_version,
-                (Paper.arxiv_id.in_(arxiv_ids))
-                | ((Paper.source == "external") & Paper.source_url.in_(source_urls)),
-            )
-            .order_by(Paper.id)
-            .all()
-        )
-        resolved: dict[str, int] = {}
-        for paper_id, arxiv_id, source_url in papers:
-            resolved[arxiv_id if arxiv_id in arxiv_ids else source_url] = paper_id
-        return resolved
-
-    def _methodology(self, entry: LeaderboardEntry) -> str:
-        board = self.board
-        return (
+        parts = [
             f"{board.managed_prefix} Official leaderboard entry "
-            f'"{entry.label}": {entry.detail}, listed at {board.url}. '
-            f"{board.protocol}"
-        )
+            f'"{entry.label}": {entry.detail}, listed at {board.url}.',
+            board.protocol,
+            notes,
+        ]
+        return " ".join(part for part in parts if part)
+
+    def _managed_notes(self, row: Evaluation) -> str:
+        """Return the reviewer notes kept beneath a managed row's head."""
+        head = self.board.managed_head.match((row.methodology or "").strip())
+        return (head and head.group("notes")) or ""
 
     def sync(
         self,
         entries: list[LeaderboardEntry],
         *,
-        evaluated_on: date | None = None,
         commit: bool = True,
     ) -> LiveSyncStats:
         board = self.board
         fetched = len(entries)
         entries = [e for e in entries if e.name not in board.excluded]
         reviewed = [e for e in entries if e.name in board.identities]
-        if len(reviewed) < board.min_selected:
+        # Several labels (settings, prompt variants) can name one model, so
+        # the floor counts the distinct models the board would publish.
+        reviewed_models = {
+            (
+                board.identities[e.name].paper_key,
+                board.identities[e.name].model_name,
+                e.harness,
+            )
+            for e in reviewed
+        }
+        if len(reviewed_models) < board.min_selected:
             raise RuntimeError(
-                f"{board.source} has only {len(reviewed)} reviewed entries; "
+                f"{board.source} has only {len(reviewed_models)} reviewed models; "
                 "refusing to update the managed leaderboard"
             )
         stats = LiveSyncStats(fetched=fetched, excluded=fetched - len(entries))
         try:
-            task, dataset = self._leaderboard_identity()
-            paper_ids = self._paper_ids()
+            task, dataset = resolve_leaderboard(
+                self.db,
+                board.source,
+                board.task_slug,
+                board.dataset_slug,
+                (board.metric,),
+            )
+            paper_ids = resolve_identity_papers(self.db, board.identities.values())
             new_entries = [e for e in entries if e.name not in board.identities]
             matcher = LeaderboardModelMatcher(
                 self.db,
@@ -288,7 +276,7 @@ class LiveLeaderboardSyncService:
                 selected.append(
                     (
                         paper_ids.get(identity.paper_key),
-                        identity.model_name,
+                        identity.model_name + board.model_name_suffix,
                         identity.is_open,
                         identity.hf_model_url,
                         entry,
@@ -301,7 +289,7 @@ class LiveLeaderboardSyncService:
                 selected.append(
                     (
                         match.paper_id,
-                        match.model_name,
+                        match.model_name + board.model_name_suffix,
                         match.is_open,
                         match.hf_model_url,
                         entry,
@@ -327,15 +315,17 @@ class LiveLeaderboardSyncService:
                 if key not in best or entry.value > best[key][4].value:
                     best[key] = item
 
-            rows = (
-                self.db.query(Evaluation)
+            rows = [
+                row
+                for row in self.db.query(Evaluation)
                 .filter(
                     Evaluation.task_id == task.id,
                     Evaluation.dataset_id == dataset.id,
                 )
                 .order_by(Evaluation.id)
                 .all()
-            )
+                if board.metric in (row.metrics or {})
+            ]
             rows_by_identity: dict[tuple[int, str, str | None], Evaluation] = {}
             unmanaged_by_model: dict[tuple[int, str], Evaluation] = {}
             for row in rows:
@@ -359,14 +349,13 @@ class LiveLeaderboardSyncService:
                 hf_model_url,
                 entry,
             ) in best.items():
-                metrics = {board.metric: entry.value}
-                methodology = self._methodology(entry)
                 # A hand-imported row may record the harness as "Not reported".
                 row = rows_by_identity.get(key)
                 if row is None and board.adopt_unmanaged:
                     fallback = unmanaged_by_model.get((paper_id, model_name))
                     if fallback is not None and id(fallback) not in published:
                         row = fallback
+                source_url = entry.source_url or board.url
                 if row is None:
                     row = Evaluation(
                         paper_id=paper_id,
@@ -376,27 +365,45 @@ class LiveLeaderboardSyncService:
                         harness=entry.harness,
                         is_open=is_open,
                         hf_model_url=hf_model_url,
-                        external_source_url=board.url,
-                        source_url=board.url,
+                        external_source_url=source_url,
+                        source_url=source_url,
                         external=True,
                         uses_additional_data=False,
+                        # The leaderboard's year column reads this date.
+                        evaluated_on=entry.evaluated_on or now.date(),
                     )
                     self.db.add(row)
                     rows_by_identity[key] = row
                     stats.created += 1
+                    notes, managed = "", False
                 elif not (row.methodology or "").startswith(board.managed_prefix):
-                    # A hand-imported row for the same model becomes managed.
-                    row.external_source_url = board.url
-                    row.source_url = board.url
+                    # A hand-imported row for the same model becomes managed;
+                    # its reviewer methodology stays as notes beneath the head.
+                    notes, managed = (row.methodology or "").strip(), False
+                    row.external_source_url = source_url
+                    row.source_url = source_url
                     row.harness = entry.harness
                     stats.adopted += 1
-                elif row.metrics != metrics or row.methodology != methodology:
+                else:
+                    notes, managed = self._managed_notes(row), True
+                stored = (row.metrics or {}).get(board.metric)
+                listed = (
+                    entry.value
+                    if isinstance(entry.value, Decimal)
+                    else Decimal(str(entry.value))
+                )
+                # A reviewer may have stored the unrounded value (48.23) the
+                # board lists at lower precision (48.2); that is not a revision.
+                value = stored if score_matches(stored, listed) else float(entry.value)
+                methodology = self._methodology(entry, notes)
+                if managed and (stored, row.methodology) != (value, methodology):
                     stats.changed += 1
-                row.metrics = metrics
+                # Other metrics a hand-imported row carries stay untouched.
+                row.metrics = {**(row.metrics or {}), board.metric: value}
                 row.methodology = methodology
                 row.best_metric = board.metric
-                if evaluated_on is not None:
-                    row.evaluated_on = evaluated_on
+                if entry.evaluated_on is not None:
+                    row.evaluated_on = entry.evaluated_on
                 row.updated_at = now
                 if paper_id not in linked_paper_ids:
                     self.db.add(

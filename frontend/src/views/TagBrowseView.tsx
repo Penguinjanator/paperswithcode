@@ -17,21 +17,19 @@ import type {
   Task,
   TrendingBenchmark,
 } from "@/lib/api/catalog.types";
-import { catalogApi } from "@/lib/api/catalog";
 import { papersApi } from "@/lib/api/papers";
-import { isNotFound } from "@/lib/apiErrors";
 import { assetUrl } from "@/lib/apiUrl";
 import { formatStarCount } from "@/lib/frameworks";
-import { paperQueryKeys } from "@/lib/paperQueryKeys";
+
 import { usePreferences } from "@/lib/preferences";
 import { slugify } from "@/lib/slug";
 import { displayTaskName, transformPaperForCard } from "@/lib/transform";
 import { usePaperFeedParams } from "@/hooks/usePaperFeedParams";
 import { usePaperFeedQuery } from "@/hooks/usePapers";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import NotFound from "@/pages/NotFound";
-import { catalogQueryKeys, TEN_MINUTES } from "@/lib/api/queryKeys";
+import { loadFailurePage } from "@/components/LoadFailurePage";
+import { catalogQueries, paperFeedKeys } from "@/lib/api/queries";
 
 const SUBTASK_BENCH_PREVIEW = 3;
 
@@ -172,14 +170,30 @@ export const HealthcareMedicalAiHub: React.FC<{
   );
 };
 
-const sortSubtasksForDisplay = (subtasks: Task[]) =>
-  [...subtasks].sort((a, b) => {
-    const aIsClassic = a.slug === "classic-language-modeling";
-    const bIsClassic = b.slug === "classic-language-modeling";
+/** Hand-tuned presentation for individual task pages; every other task uses the defaults. */
+interface TaskPagePresentation {
+  wideHero?: boolean;
+  compactFigure?: boolean;
+  /** A feature section between the hero and the benchmarks. */
+  feature?: React.FC<{ task: Task; relatedTasks: Task[] }>;
+  /** The feature already links the related tasks, so the sidebar does not repeat them. */
+  featureListsRelatedTasks?: boolean;
+}
 
-    if (aIsClassic !== bIsClassic) return aIsClassic ? 1 : -1;
-    return 0;
-  });
+const TASK_PAGES: Record<string, TaskPagePresentation> = {
+  "auto-research": { wideHero: true },
+  "omni-models": { compactFigure: true },
+  healthcare: { feature: HealthcareMedicalAiHub, featureListsRelatedTasks: true },
+  robotics: { feature: AstraRoboticsFeature },
+};
+
+/** Subtasks kept after the others, such as the pre-LLM language-modeling lineage. */
+const SUBTASKS_LISTED_LAST: ReadonlySet<string | undefined> = new Set(["classic-language-modeling"]);
+
+const sortSubtasksForDisplay = (subtasks: Task[]) =>
+  [...subtasks].sort(
+    (a, b) => Number(SUBTASKS_LISTED_LAST.has(a.slug)) - Number(SUBTASKS_LISTED_LAST.has(b.slug)),
+  );
 
 const TagBrowseView: React.FC = () => {
   const { taskSlug } = useParams<{ taskSlug: string }>();
@@ -206,12 +220,7 @@ const TagBrowseView: React.FC = () => {
   // chain, sister tasks, visible children, this task's benchmarks, and a short
   // benchmark preview per child. This replaces the previous fan-out of six+
   // independent task/dataset queries on initial load (see Speed plan §1).
-  const pageQ = useQuery({
-    queryKey: [...catalogQueryKeys.taskPage, taskSlug, bestModelIsOpen],
-    queryFn: () => catalogApi.taskPage(taskSlug!, { is_open: bestModelIsOpen }),
-    enabled: !!taskSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const pageQ = useQuery(catalogQueries.taskPage(taskSlug, { is_open: bestModelIsOpen }));
 
   useEffect(() => {
     const canonicalSlug = pageQ.data?.task.slug;
@@ -221,17 +230,11 @@ const TagBrowseView: React.FC = () => {
     navigate(`/tasks/${canonicalSlug}${query ? `?${query}` : ""}`, { replace: true });
   }, [navigate, pageQ.data?.task.slug, searchParams, taskSlug]);
 
-  const benchmarkTrendsQ = useQuery({
-    queryKey: [...catalogQueryKeys.taskBenchmarkTrends, taskSlug, bestModelIsOpen],
-    queryFn: () =>
-      catalogApi.trendingBenchmarks(taskSlug!, {
-        limit: 100,
-        min_recent_papers: 0,
-        is_open: bestModelIsOpen,
-      }),
-    enabled: !!taskSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const benchmarkTrendsQ = useQuery(catalogQueries.taskBenchmarkTrends(taskSlug, {
+    limit: 100,
+    min_recent_papers: 0,
+    is_open: bestModelIsOpen,
+  }));
 
   // Subtasks (child tasks). Classic LM is the historical catch-all, so keep it
   // after the capability-oriented subtasks.
@@ -253,7 +256,7 @@ const TagBrowseView: React.FC = () => {
   // The papers endpoint resolves slugs itself, so start the feed in parallel
   // with the task-page shell instead of waiting for its task id.
   const papersQ = usePaperFeedQuery(
-    [...paperQueryKeys.feeds.task, taskSlug, feed.filters],
+    paperFeedKeys.task(taskSlug, feed.filters),
     // Cards show only the leading repository; highly cited papers can
     // otherwise carry hundreds of community implementations each.
     (page) => papersApi.forTask(taskSlug!, { ...feed.filters, page, page_size: 20, repository_limit: 1 }),
@@ -290,21 +293,16 @@ const TagBrowseView: React.FC = () => {
     );
   }
 
-  if (isNotFound(pageQ.error)) return <NotFound />;
-  if (pageQ.error || !pageQ.data) {
-    return (
-      <div className="page">
-        <Alert variant="destructive">
-          <AlertDescription>Task not found.</AlertDescription>
-        </Alert>
-      </div>
-    );
+  if (!pageQ.data) {
+    return loadFailurePage([pageQ.error], "Failed to load this task. Please try again.") ?? <NotFound />;
   }
 
   const task = pageQ.data.task;
   const parents = pageQ.data.parents || [];
   const taskName = displayTaskName(task.name, task.slug);
   const sisters = (pageQ.data.sisters || []).filter((s) => s.id !== task.id);
+  const presentation: TaskPagePresentation = (task.slug && TASK_PAGES[task.slug]) || {};
+  const Feature = presentation.feature;
   const recommendedFrameworks = pageQ.data.recommended_frameworks || [];
   const datasets = pageQ.data.benchmarks || [];
   const datasetsById = new Map(datasets.map((dataset) => [dataset.id, dataset]));
@@ -390,7 +388,7 @@ const TagBrowseView: React.FC = () => {
       <div
         className={
           task.image_url
-            ? `task-hero-grid${task.slug === "auto-research" ? " task-hero-grid--wide" : ""}`
+            ? `task-hero-grid${presentation.wideHero ? " task-hero-grid--wide" : ""}`
             : undefined
         }
       >
@@ -418,9 +416,7 @@ const TagBrowseView: React.FC = () => {
         </div>
         {task.image_url && (
           <figure
-            className={`task-figure-card${
-              task.slug === "omni-models" ? " task-figure-card--compact" : ""
-            }`}
+            className={`task-figure-card${presentation.compactFigure ? " task-figure-card--compact" : ""}`}
           >
             <div className="task-figure-img-wrap">
               <img
@@ -445,11 +441,7 @@ const TagBrowseView: React.FC = () => {
         )}
       </div>
 
-      {task.slug === "healthcare" && (
-        <HealthcareMedicalAiHub task={task} relatedTasks={sisters} />
-      )}
-
-      {task.slug === "robotics" && <AstraRoboticsFeature />}
+      {Feature && <Feature task={task} relatedTasks={sisters} />}
 
       <div className="task-page-grid" style={{ marginTop: 28 }}>
         <div>
@@ -709,7 +701,7 @@ const TagBrowseView: React.FC = () => {
         </div>
 
         <aside className="task-side">
-          {sisters.length > 0 && task.slug !== "healthcare" && (
+          {sisters.length > 0 && !presentation.featureListsRelatedTasks && (
             <div className="side-block">
               <div className="side-block-num">01/</div>
               <div className="side-block-label">Sister Tasks</div>

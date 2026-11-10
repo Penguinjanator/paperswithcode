@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from backend.config import get_settings
+from backend.models.database import UserProfile
 from backend.models.database.research import (
     ResearchTopic,
     ResearchTopicFollow,
@@ -495,15 +496,30 @@ def save_preview(db: Session, topic: ResearchTopic, now: datetime) -> None:
     db.commit()
 
 
+def catalog_key(value: str) -> str:
+    """A name compared loosely: lowercase, punctuation and hyphens as spaces."""
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
 def suggestions(db: Session, value: str) -> list[TopicSuggestion]:
-    """Catalog tasks, methods and benchmarks named exactly like the topic."""
+    """Catalog tasks, methods and benchmarks named like the topic.
+
+    Names match ignoring case, punctuation and hyphens, so "time series
+    forecasting" finds the task "Time-series forecasting".
+    """
     from backend.services.research_follow_service import ENTITIES
 
+    key = catalog_key(value)
+    if not key:
+        return []
     found = []
     for kind in ("task", "method", "benchmark"):
         model, route = ENTITIES[kind]
+        name_key = func.trim(
+            func.regexp_replace(func.lower(model.name), "[^a-z0-9]+", " ", "g")
+        )
         for entity in db.scalars(
-            select(model).where(func.lower(model.name) == normalize(value)).limit(1)
+            select(model).where(name_key == key).order_by(model.id).limit(1)
         ):
             slug = getattr(entity, "slug", None) or entity.id
             found.append(
@@ -519,9 +535,16 @@ def suggestions(db: Session, value: str) -> list[TopicSuggestion]:
 
 def topic_views(db: Session, subject: str) -> list[TopicView]:
     """The account's topics in its own order, then oldest first."""
+    from backend.services.public_topic_service import person
+
     rows = db.execute(
-        select(ResearchTopic, ResearchTopicFollow.created_at)
+        select(
+            ResearchTopic, ResearchTopicFollow.created_at, UserProfile.current_username
+        )
         .join(ResearchTopicFollow, ResearchTopicFollow.topic_id == ResearchTopic.id)
+        .outerjoin(
+            UserProfile, UserProfile.hf_subject == ResearchTopic.created_by_hf_subject
+        )
         .where(ResearchTopicFollow.hf_subject == subject)
         .order_by(
             ResearchTopicFollow.position.asc().nulls_last(),
@@ -541,8 +564,12 @@ def topic_views(db: Session, subject: str) -> list[TopicView]:
             suggestions=suggestions(db, topic.text),
             is_public=topic.is_public,
             is_creator=topic.created_by_hf_subject == subject,
+            # Only public topics name their creator.
+            creator=person(creator)
+            if topic.is_public and topic.created_by_hf_subject != subject
+            else None,
         )
-        for topic, set_at in rows
+        for topic, set_at, creator in rows
     ]
 
 

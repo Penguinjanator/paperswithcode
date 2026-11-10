@@ -117,12 +117,12 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 ## `sync_vals_finance_agent`
 
 - **Contract:** `finance-agent-v2` on task `agents`; Accuracy (%) 0–100; the single table on https://www.vals.ai/benchmarks/fabv2; typically 40–400 upstream rows, of which only reviewed labels are published (all 78 on 2026-10-16).
-- **Proof:** Diff the Vals table against managed rows (label, accuracy at two decimals); confirm `vals_finance_agent_unreviewed` labels get an identity (index the model's paper first), `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on Accuracy.
+- **Proof:** Diff the Vals table against managed rows (label, accuracy at two decimals); confirm `sync_vals_finance_agent_unreviewed` labels become radar signals or get an identity in `vals_finance_agent_sync_service.py`, reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); verify ranks on Accuracy.
 
 ## `sync_surge_chartography`
 
 - **Contract:** `chartography-no-tools` on task `image-understanding`; Pass@1 0–1 (Surge percent / 100); the "Chartography Leaderboard" block on https://surgehq.ai/benchmarks/chartography (fetch with a browser User-Agent); typically 25–400 upstream rows, of which only reviewed labels are published (41 of 42 on 2026-10-17; DeepSeek V4 Flash Vision (experimental) is excluded on purpose).
-- **Proof:** Diff the Surge block against managed rows (label, percent at one decimal); confirm `surge_chartography_unreviewed` labels get an identity (index the model's paper first), `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); confirm the with-tools `chartography` benchmark was not touched.
+- **Proof:** Diff the Surge block against managed rows (label, percent at one decimal); confirm `sync_surge_chartography_unreviewed` labels become radar signals or get an identity in `surge_chartography_sync_service.py`, reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (never deleted automatically); confirm the with-tools `chartography` benchmark was not touched.
 
 ## `sync_frontiercs_2`
 
@@ -188,7 +188,7 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 ## `sync_physics_iq_verified`
 
 - **Contract:** `physics-iq-verified` on task `video-generation`; Physics-IQ Verified Score (I2V) and (V2V), 0–100; Verified table of the official `google-deepmind/physics-IQ-benchmark` README; typically 30–300 upstream rows, of which only reviewed labels are published (33 on 2026-10-13), one per model and track.
-- **Proof:** Diff the README table against managed rows (label, track, score at README precision, ± SD, date added); confirm `physics_iq_verified_unreviewed` warnings are either mapped or covered by the exclusion rules, `missing_papers` is empty, and `missing_upstream` rows were investigated (they are never deleted automatically); verify ranks on both metrics.
+- **Proof:** Diff the README table against managed rows (label, track, score at README precision, ± SD, date added); confirm `sync_physics_iq_verified_unreviewed` warnings become radar signals, get an identity, or are covered by the exclusion rules; reviewer notes beneath each managed head survived, `missing_papers` is empty, and `missing_upstream` rows were investigated (they are never deleted automatically); verify ranks on both metrics.
 
 ## `sync_frontiercode`
 
@@ -277,20 +277,6 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Independent proof:** `curl https://paperswithcode.co/api/v1/papers/<id>/suggested-questions` for a top home-feed paper returns three questions within ~0.2 s (stored, not generated).
 - **Correctness:** `remaining` should reach 0 after a few runs and stay near 0; a persistent `failed` count with `suggested_questions_failed` warnings means OpenAI errors (key, quota, or model name).
 - **Dashboard evidence:** `visible_missing` of `visible_papers` = the top 90 trending latest papers of the past week (an approximation of the home feed's three pages) without a `paper_suggested_questions` row. Zero is healthy even with no recent writes; more than 5 degrades. The task/method part of the cohort needs the probe above.
-
-## `post_trending_paper_to_x`
-
-- **Effect:** Prints a JSON summary (`paper_id`, `text`, `url`, `post_id`, `reply_id`, `errors`) and inserts one `paper_x_posts` row per post. Posts at most one paper per run: the top `trending_score` arXiv paper from the last 14 days with a TL;DR that was never posted. Exits 0 with an `x_trending_post_skipped` warning (dry run) when the `X_POST_*` OAuth 1.0a keys are unset, and 1 only when candidates existed but none could be fetched and rendered.
-- **Independent proof:** Open `https://x.com/i/status/<post_id>` and confirm the first-page image, title, TL;DR, and the paper link reply.
-- **Correctness:** `X HTTP 401` means bad keys, `403` a read-only app or a post over the account's length limit (`PWC_X_POST_MAX_CHARS`), `402` exhausted credits. A null `paper_id` without errors means every recent trending paper was already posted.
-- **Dashboard evidence:** latest `paper_x_posts.posted_at` and posts in 24 h. Six runs a day normally post several papers, so a day without a post degrades the job; confirm with `SELECT posted_at, paper_id FROM paper_x_posts ORDER BY posted_at DESC LIMIT 10` before blaming X.
-
-## `post_x_insight`
-
-- **Effect:** Prints a JSON summary (`kind`, `subject_key`, `text`, `template`, `url`, `post_id`, `reply_id`, `tried`) and inserts one `x_insight_posts` row per post. A null `kind` means no tried kind had anything new (healthy). An `x_insight_rewrite_rejected` warning means Luna changed a number and the template was posted instead.
-- **Independent proof:** Open `https://x.com/i/status/<post_id>`; check the numbers against the linked benchmark, method, or task page.
-- **Correctness:** Same X errors as `post_trending_paper_to_x` (shared `X_POST_*` keys and credits). A SOTA post must name a paper published in the last 45 days that leads a leaderboard with at least 5 entries.
-- **Dashboard evidence:** latest `x_insight_posts.posted_at` and posts in 72 h; a quiet run is healthy, so only three days without any insight degrade. Check `SELECT kind, max(posted_at), count(*) FROM x_insight_posts GROUP BY kind` for a kind that stopped posting.
 
 ## `scan_model_releases`
 

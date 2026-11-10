@@ -8,10 +8,10 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { usePaperFeedQuery } from '@/hooks/usePapers';
 import { researchApi, TOPIC_PAPERS_PAGE_SIZE, type PublicTopic, type TopicPaperOrder, type TopicPerson } from '@/lib/api/research';
 import { readHomepagePaperDateRange, withHomepagePaperDateRange } from '@/lib/paperDateRange';
-import { researchQueryKeys } from '@/lib/api/queryKeys';
+import { researchKeys, researchQueries } from '@/lib/api/queries';
 import { hfLoginUrl, isAuthDisabled } from '@/lib/apiUrl';
 import { useOptionalAuth } from '@/lib/authContext';
-import { ApiError } from '@/lib/apiTransport';
+import { ApiError, isNotFound } from '@/lib/apiTransport';
 import {
   readPendingTopicFollow, stashPendingTopicFollow, topicPath, topicTitle, useFollowTopic, useRemoveTopics,
 } from '@/lib/researchTopic';
@@ -34,13 +34,12 @@ export default function TopicView() {
     setSearchParams(next);
   };
   const topic = useQuery({
-    queryKey: researchQueryKeys.publicTopic(topicId, subject),
-    queryFn: () => researchApi.publicTopic(topicId),
+    ...researchQueries.publicTopic(topicId, subject),
     enabled: Number.isInteger(topicId) && topicId > 0,
-    retry: (count, error) => !(error instanceof ApiError && error.status === 404) && count < 2,
+    retry: (count, error) => !isNotFound(error) && count < 2,
   });
   const papers = usePaperFeedQuery(
-    researchQueryKeys.topicPapers(topicId, order, dateRange, subject),
+    researchKeys.topicPapers(topicId, order, dateRange, subject),
     async (offset) => {
       const results = await researchApi.topicPapers(topicId, order, offset, dateRange);
       return { results, next_page: results.length === TOPIC_PAPERS_PAGE_SIZE ? offset + TOPIC_PAPERS_PAGE_SIZE : null };
@@ -200,7 +199,7 @@ function FollowTopicButton({ topic }: { topic: PublicTopic }) {
       </> : <><Plus aria-hidden="true" />Follow</>}
     </button>
     {error && <span className="research-follow-hint is-error" role="alert">
-      {error instanceof ApiError && error.status === 409 ? 'You follow the maximum number of topics. Remove one in Settings first.' : 'Could not update this topic. Please try again.'}
+      {error instanceof ApiError && error.status === 409 ? 'You follow the maximum number of topics. Unfollow one in Edit feed on Following first.' : 'Could not update this topic. Please try again.'}
     </span>}
   </>;
 }

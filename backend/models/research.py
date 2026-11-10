@@ -17,6 +17,8 @@ class FollowView(BaseModel):
     created_at: datetime
     # An author's face or an organization's logo, for follow chips.
     image_url: str | None = None
+    # A subtask's parent task slug, so the bubble can borrow the parent's icon.
+    parent_slug: str | None = None
 
 
 class FollowSuggestion(BaseModel):
@@ -46,6 +48,13 @@ class TopicSuggestion(BaseModel):
     url: str
 
 
+class TopicPerson(BaseModel):
+    """A Hugging Face account shown on a public topic."""
+
+    username: str
+    avatar_url: str
+
+
 class TopicView(BaseModel):
     id: int
     text: str
@@ -61,6 +70,8 @@ class TopicView(BaseModel):
     # creator may change it.
     is_public: bool = True
     is_creator: bool = False
+    # Who made a topic the account follows from someone else; None for its own.
+    creator: TopicPerson | None = None
 
 
 class TopicOrderUpdate(BaseModel):
@@ -71,13 +82,6 @@ class TopicOrderUpdate(BaseModel):
 
 class TopicVisibilityUpdate(BaseModel):
     is_public: bool
-
-
-class TopicPerson(BaseModel):
-    """A Hugging Face account shown on a public topic."""
-
-    username: str
-    avatar_url: str
 
 
 class PublicTopicView(BaseModel):

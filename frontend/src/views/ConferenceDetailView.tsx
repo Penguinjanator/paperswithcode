@@ -4,28 +4,21 @@ import { useQuery } from "@tanstack/react-query";
 
 import { AreaDirectoryFooter, AreaDirectorySkeleton, AreaSection } from "@/components/AreaSection";
 import MarkdownText from "@/components/MarkdownText";
-import { catalogApi } from "@/lib/api/catalog";
-import { isNotFound } from "@/lib/apiErrors";
+import { catalogQueries } from "@/lib/api/queries";
 import { sortAreas } from "@/lib/areas";
 import { chipColors, hueFromSlug } from "@/lib/colors";
 import { CONFERENCE_LISTINGS } from "@/lib/conferenceListings";
 import { formatDateRange } from "@/lib/deadlines";
 import { displayTaskName } from "@/lib/transform";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { safeExternalHref } from "@/lib/safeExternalHref";
-import NotFound from "@/pages/NotFound";
-import { TEN_MINUTES } from "@/lib/api/queryKeys";
+import { loadFailurePage } from "@/components/LoadFailurePage";
+
 
 const ConferenceDetailView: React.FC = () => {
   const { confSlug } = useParams<{ confSlug: string }>();
 
-  const taxonomyQ = useQuery({
-    queryKey: ["conference-areas-with-tasks", confSlug],
-    queryFn: () => catalogApi.conferenceAreasWithTasks(confSlug!),
-    enabled: !!confSlug,
-    staleTime: TEN_MINUTES,
-  });
+  const taxonomyQ = useQuery(catalogQueries.conferenceAreasWithTasks(confSlug));
 
   const visibleAreas = useMemo(() => sortAreas(taxonomyQ.data?.results ?? []), [taxonomyQ.data]);
 
@@ -35,16 +28,8 @@ const ConferenceDetailView: React.FC = () => {
     (listing) => (taxonomyQ.data?.[listing.countKey] ?? 0) > 0,
   );
 
-  if (isNotFound(taxonomyQ.error)) return <NotFound />;
-  if (taxonomyQ.error) {
-    return (
-      <div className="page">
-        <Alert variant="destructive">
-          <AlertDescription>Failed to load conference. Please try again.</AlertDescription>
-        </Alert>
-      </div>
-    );
-  }
+  const failure = loadFailurePage([taxonomyQ.error], "Failed to load conference. Please try again.");
+  if (failure) return failure;
 
   const dates = conference ? formatDateRange(conference.start_date, conference.end_date) : null;
   const venueLine = conference

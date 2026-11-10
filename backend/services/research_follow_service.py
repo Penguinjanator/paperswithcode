@@ -3,10 +3,11 @@
 from datetime import date, datetime, timedelta
 import re
 import secrets
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from fastapi import HTTPException
-from sqlalchemy import Integer, String, column, exists, select, text
+from sqlalchemy import Integer, String, and_, column, exists, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -125,6 +126,7 @@ def follows(db: Session, subject: str) -> list[FollowView]:
             else {}
         )
         images = _image_urls(db, kind, list(entities.values()))
+        parents = _parent_slugs(db, list(entities.values())) if kind == "task" else {}
         for row in group:
             entity = entities.get(row.entity_id)
             if entity:
@@ -136,9 +138,19 @@ def follows(db: Session, subject: str) -> list[FollowView]:
                         url=_entity_url(kind, entity),
                         created_at=row.created_at,
                         image_url=images.get(entity.id),
+                        parent_slug=parents.get(entity.parent_id)
+                        if kind == "task"
+                        else None,
                     )
                 )
     return result
+
+
+def _parent_slugs(db: Session, tasks: list) -> dict[int, str]:
+    ids = {task.parent_id for task in tasks if task.parent_id}
+    if not ids:
+        return {}
+    return dict(db.execute(select(Task.id, Task.slug).where(Task.id.in_(ids))).all())
 
 
 class Interest(NamedTuple):
@@ -475,7 +487,8 @@ def feed_entries(
     has_code: bool = False,
     has_hf_artifacts: bool = False,
     topic_only: bool = False,
-    topic_id: int | None = None,
+    topic_ids: Sequence[int] = (),
+    follows: Sequence[tuple[str, int]] = (),
 ) -> list[ResearchFeedEntry]:
     """Filter and rank matches like the home feed, then explain only the returned page."""
     from backend.services.paper_service import PaperService
@@ -496,10 +509,19 @@ def feed_entries(
         .subquery("matches")
     )
     matched_ids = select(matches.c.id)
-    if topic_only or topic_id is not None:
+    # Selected topics and follows combine as either-or, like merging their feeds.
+    selected = [
+        and_(matches.c.kind == kind, matches.c.entity_id == entity_id)
+        for kind, entity_id in follows
+    ]
+    if topic_ids:
+        selected.append(
+            and_(matches.c.kind == "topic", matches.c.entity_id.in_(topic_ids))
+        )
+    if selected:
+        matched_ids = matched_ids.where(or_(*selected))
+    elif topic_only:
         matched_ids = matched_ids.where(matches.c.kind == "topic")
-    if topic_id is not None:
-        matched_ids = matched_ids.where(matches.c.entity_id == topic_id)
     service = PaperService(db)
     query = db.query(DBPaper).filter(DBPaper.id.in_(matched_ids))
     if has_code:

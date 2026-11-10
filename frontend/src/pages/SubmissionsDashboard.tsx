@@ -1,9 +1,12 @@
-import { evaluationChange, refreshEvaluationQueries } from "@/lib/evaluationQueryInvalidation";
-import { paperQueryKeys } from "@/lib/paperQueryKeys";
-import { invalidatePaperDetails, invalidatePaperFeeds } from "@/lib/queryInvalidation";
+import {
+  evaluationChange,
+  invalidatePaperDetails,
+  invalidatePaperFeeds,
+  refreshEvaluationQueries,
+} from "@/lib/api/cacheSync";
 import React from "react";
 import "./SubmissionsDashboard.css";
-import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
   Inbox,
@@ -23,22 +26,14 @@ import {
   type PendingEditType,
   type PendingPaperEdit,
 } from "@/lib/pendingEdits";
-import { papersApi } from "@/lib/api/papers";
-import type { Paper } from "@/lib/api/papers.types";
 import { catalogApi } from "@/lib/api/catalog";
 import { submissionsApi } from "@/lib/api/submissions";
 import { cn } from "@/lib/utils";
-import { submissionQueryKeys } from "@/lib/api/queryKeys";
+import { submissionKeys } from "@/lib/api/queries";
 
 const PAGE_SIZE = 25;
 const STATUS_FILTERS: Array<PendingEditStatus | "all"> = ["pending", "approved", "rejected", "all"];
 const EDIT_TYPE_FILTERS = ["all", ...Object.keys(EDIT_TYPE_META)] as Array<PendingEditType | "all">;
-const COUNT_STATUSES: PendingEditStatus[] = ["pending", "approved", "rejected"];
-
-interface ListData {
-  count: number;
-  results: PendingPaperEdit[];
-}
 
 function initialsFor(username: string): string {
   return username.slice(0, 2).toUpperCase();
@@ -71,59 +66,8 @@ function statusClass(status: PendingEditStatus): string {
   return "pending";
 }
 
-function paperRouteIdentifier(paper: Paper | undefined, fallbackId: number): string {
-  return paper?.arxiv_id || paper?.id || String(fallbackId);
-}
-
-function sortByCreatedDesc(rows: PendingPaperEdit[]): PendingPaperEdit[] {
-  return [...rows].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-}
-
-type StatusOffsets = Partial<Record<PendingEditStatus, number>>;
-
-interface SubmissionPage extends ListData {
-  nextOffsets: StatusOffsets | null;
-}
-
-// One page of the newest submissions across `statuses`. Each status list is
-// sorted newest first, so merging the next PAGE_SIZE rows of every list and
-// keeping the newest PAGE_SIZE gives the exact next page; each status offset
-// advances only by the rows it contributed.
-async function fetchSubmissionPage(
-  statuses: PendingEditStatus[],
-  editType: PendingEditType | "all",
-  autoOnly: boolean,
-  offsets: StatusOffsets,
-): Promise<SubmissionPage> {
-  const lists = await Promise.all(
-    statuses.map((status) =>
-      submissionsApi.list({
-        status,
-        edit_type: editType === "all" ? undefined : editType,
-        reviewed_by_kind: autoOnly ? "auto" : undefined,
-        limit: PAGE_SIZE,
-        offset: offsets[status] ?? 0,
-      }),
-    ),
-  );
-  const results = sortByCreatedDesc(lists.flatMap((list) => list.results)).slice(0, PAGE_SIZE);
-  const nextOffsets: StatusOffsets = {};
-  statuses.forEach((status, index) => {
-    const taken = results.filter((row) => lists[index].results.includes(row)).length;
-    nextOffsets[status] = (offsets[status] ?? 0) + taken;
-  });
-  const count = lists.reduce((sum, list) => sum + list.count, 0);
-  const loaded = statuses.reduce((sum, status) => sum + (nextOffsets[status] ?? 0), 0);
-  return { count, results, nextOffsets: results.length > 0 && loaded < count ? nextOffsets : null };
-}
-
-function SubmissionCard({
-  submission,
-  paper,
-}: {
-  submission: PendingPaperEdit;
-  paper?: Paper;
-}) {
+function SubmissionCard({ submission }: { submission: PendingPaperEdit }) {
+  const paper = submission.paper;
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const paperId = submission.paper_id;
@@ -133,9 +77,7 @@ function SubmissionCard({
     title: "Taxonomy directory",
     subtitle: "Directory suggestion",
   };
-  const routeIdentifier = isDirectorySuggestion
-    ? null
-    : paperRouteIdentifier(paper, paperId);
+  const routeIdentifier = isDirectorySuggestion ? null : paper?.arxiv_id || String(paperId);
   const paperTitle = isDirectorySuggestion
     ? directoryLabels.title
     : paper?.title || `Paper #${paperId}`;
@@ -147,7 +89,7 @@ function SubmissionCard({
 
   const invalidateAfterReview = React.useCallback(
     (reviewed: PendingPaperEdit) => {
-      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
+      queryClient.invalidateQueries({ queryKey: submissionKeys.pendingEdits });
       if (reviewed.paper_id != null && reviewed.edit_type !== "evaluations") {
         invalidatePaperDetails(queryClient, [String(reviewed.paper_id), paper?.arxiv_id]);
       }
@@ -206,7 +148,7 @@ function SubmissionCard({
   const revertMutation = useMutation<unknown, unknown, void>({
     mutationFn: () => catalogApi.rollbackEvent(submission.catalog_event_id as string),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
+      queryClient.invalidateQueries({ queryKey: submissionKeys.pendingEdits });
       if (submission.paper_id != null) {
         invalidatePaperDetails(queryClient, [String(submission.paper_id), paper?.arxiv_id]);
         invalidatePaperFeeds(queryClient);
@@ -230,7 +172,7 @@ function SubmissionCard({
     mutationFn: (suspend) =>
       submissionsApi.revertAutoApproved(submission.hf_subject as string, { suspend }),
     onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: submissionQueryKeys.pendingEdits });
+      queryClient.invalidateQueries({ queryKey: submissionKeys.pendingEdits });
       invalidatePaperFeeds(queryClient);
       toast({
         title: `Reverted ${result.reverted} edits by @${submission.hf_username}`,
@@ -422,71 +364,31 @@ export default function SubmissionsDashboard() {
   const [editType, setEditType] = React.useState<PendingEditType | "all">("all");
   const [autoOnly, setAutoOnly] = React.useState(false);
 
+  const filters = {
+    edit_type: editType === "all" ? undefined : editType,
+    reviewed_by_kind: autoOnly ? ("auto" as const) : undefined,
+  };
+  // Counts ignore the status tab, so switching tabs reuses them.
   const countsQuery = useQuery({
-    queryKey: [...submissionQueryKeys.pendingEdits, "counts", editType, autoOnly],
-    queryFn: async () => {
-      const edit_type = editType === "all" ? undefined : editType;
-      const pages = await Promise.all(
-        COUNT_STATUSES.map((itemStatus) =>
-          submissionsApi.list({
-            status: itemStatus,
-            edit_type,
-            reviewed_by_kind: autoOnly ? "auto" : undefined,
-            limit: 1,
-            offset: 0,
-          }),
-        ),
-      );
-      return Object.fromEntries(
-        pages.map((page, index) => [COUNT_STATUSES[index], page.count]),
-      ) as Record<PendingEditStatus, number>;
-    },
+    queryKey: submissionKeys.counts(editType, autoOnly),
+    queryFn: async () => (await submissionsApi.list({ ...filters, status: "all", limit: 1 })).status_counts,
     staleTime: 30 * 1000,
   });
 
   const listQuery = useInfiniteQuery({
-    queryKey: [...submissionQueryKeys.pendingEdits, { status, editType, autoOnly }],
-    queryFn: ({ pageParam }) =>
-      fetchSubmissionPage(status === "all" ? COUNT_STATUSES : [status], editType, autoOnly, pageParam),
-    initialPageParam: {} as StatusOffsets,
-    getNextPageParam: (page) => page.nextOffsets ?? undefined,
+    queryKey: submissionKeys.list({ status, editType, autoOnly }),
+    queryFn: ({ pageParam }) => submissionsApi.list({ ...filters, status, limit: PAGE_SIZE, offset: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: (page, pages) => {
+      const loaded = pages.reduce((sum, { results }) => sum + results.length, 0);
+      return page.results.length > 0 && loaded < page.count ? loaded : undefined;
+    },
     retry: false,
   });
   const submissions = React.useMemo(
     () => listQuery.data?.pages.flatMap((page) => page.results) ?? [],
     [listQuery.data],
   );
-
-  const paperIds = React.useMemo(
-    () =>
-      Array.from(
-        new Set(
-          submissions
-            .map((row) => row.paper_id)
-            .filter((paperId): paperId is number => paperId != null),
-        ),
-      ).sort((a, b) => a - b),
-    [submissions],
-  );
-
-  const paperQueries = useQueries({
-    queries: paperIds.map((paperId) => ({
-      queryKey: paperQueryKeys.summary(String(paperId)),
-      queryFn: () => papersApi.get(String(paperId), false),
-        staleTime: 5 * 60 * 1000,
-    })),
-  });
-
-  const papersById = React.useMemo(() => {
-    const map = new Map<number, Paper>();
-    paperQueries.forEach((query) => {
-      const paper = query.data;
-      if (!paper) return;
-      const id = Number(paper.id);
-      if (Number.isFinite(id)) map.set(id, paper);
-    });
-    return map;
-  }, [paperQueries]);
 
   React.useEffect(() => {
     if (!listQuery.error) return;
@@ -616,15 +518,7 @@ export default function SubmissionsDashboard() {
         ) : (
           <div className="submission-list">
             {submissions.map((submission) => (
-              <SubmissionCard
-                key={submission.id}
-                submission={submission}
-                paper={
-                  submission.paper_id == null
-                    ? undefined
-                    : papersById.get(submission.paper_id)
-                }
-              />
+              <SubmissionCard key={submission.id} submission={submission} />
             ))}
           </div>
         )}
