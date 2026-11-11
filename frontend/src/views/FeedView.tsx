@@ -1,4 +1,5 @@
 import FollowingIntro from "@/components/FollowingIntro";
+import HomeFollowCard from "@/components/HomeFollowCard";
 import TopicDialog from "@/components/TopicDialog";
 import FollowBubbles, { type FeedFilter } from "@/components/FollowBubbles";
 import { isAuthDisabled } from "@/lib/apiUrl";
@@ -11,10 +12,12 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { PaperFeedList, type PaperFeedCard } from "@/components/PaperFeed";
 import { McpShowcase } from "@/components/McpShowcase";
 import { PaperDateFilter } from "@/components/PaperDateFilter";
+import { DictationButton } from "@/components/chat/DictationButton";
 import { ArrowUpIcon } from "@/components/chat/icons";
 import { PaperMentionHighlights } from "@/components/chat/PaperMentionHighlights";
 import { PaperMentionPicker } from "@/components/chat/PaperMentionPicker";
 import { completedScrollHeight, isCompletionKey, useChatCompletion } from "@/components/chat/useChatCompletion";
+import { useComposerDictation } from "@/components/chat/useComposerDictation";
 import { usePaperMentions } from "@/components/chat/usePaperMentions";
 import { chatApi } from "@/lib/api/chat";
 import {
@@ -34,7 +37,7 @@ import { usePaperFeedQuery } from "@/hooks/usePapers";
 import type { Paper } from "@/lib/api/papers.types";
 import type { PaginatedResponse } from "@/lib/api/shared.types";
 import { papersApi } from "@/lib/api/papers";
-import { catalogQueries, paperFeedKeys } from "@/lib/api/queries";
+import { catalogQueries, paperFeedKeys, researchQueries } from "@/lib/api/queries";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -134,6 +137,22 @@ export const AskAssistant: React.FC = () => {
     enabled: paperMentionsEnabled,
     textareaRef: ref,
   });
+  // Enter or Send while dictating finishes the recording, then asks.
+  const sendAfterDictation = useRef(false);
+  const [sendQueued, setSendQueued] = useState(false);
+  const dictation = useComposerDictation({
+    draft,
+    onChange: setDraft,
+    textareaRef: ref,
+    onEnd: (cancelled) => {
+      if (sendAfterDictation.current && !cancelled) setSendQueued(true);
+      sendAfterDictation.current = false;
+    },
+  });
+  const sendAfterRecording = () => {
+    sendAfterDictation.current = true;
+    dictation.finish();
+  };
   const typedCompletion = useChatCompletion(draft, mentions.open);
   // Tab accepts the shown suggestion: the whole prompt in an empty box, or the
   // rest of what the visitor has started typing.
@@ -166,6 +185,14 @@ export const AskAssistant: React.FC = () => {
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
   }, [question, completion]);
+
+  useEffect(() => {
+    if (!sendQueued) return;
+    setSendQueued(false);
+    void submit();
+    // submit reads the draft rendered with the final transcript.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sendQueued]);
 
   const submit = async (nextDraft = draft) => {
     const q = nextDraft.text.trim();
@@ -219,6 +246,7 @@ export const AskAssistant: React.FC = () => {
               placeholder={placeholder}
               aria-label="Ask the assistant"
               disabled={launching}
+              readOnly={dictation.active}
               onChange={(event) => {
                 mentions.updateText(event.target.value, event.target.selectionStart);
                 typedCompletion.trackCaret(event.target);
@@ -236,6 +264,13 @@ export const AskAssistant: React.FC = () => {
                 if (!event.relatedTarget?.closest?.(".chat-paper-picker")) window.setTimeout(mentions.close, 0);
               }}
               onKeyDown={(event) => {
+                if (dictation.active) {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    if (dictation.phase === "recording") sendAfterRecording();
+                  }
+                  return;
+                }
                 if (mentions.keyDown(event)) return;
                 if (isCompletionKey(event) && completion) {
                   event.preventDefault();
@@ -259,11 +294,12 @@ export const AskAssistant: React.FC = () => {
               aria-describedby={mentions.message ? "ask-home-paper-mention-message" : undefined}
             />
           </div>
+          {!mirror && <DictationButton dictation={dictation} disabled={launching} />}
           <button
             type="button"
-            className={`chat-send${question.trim() ? " chat-send-on" : ""}`}
-            onClick={() => void submit()}
-            disabled={!question.trim() || launching}
+            className={`chat-send${question.trim() || dictation.phase === "recording" ? " chat-send-on" : ""}`}
+            onClick={() => (dictation.active ? sendAfterRecording() : void submit())}
+            disabled={launching || (dictation.active ? dictation.phase !== "recording" : !question.trim())}
             aria-label="Ask the assistant"
           >
             <ArrowUpIcon />
@@ -275,6 +311,9 @@ export const AskAssistant: React.FC = () => {
               Open this question on paperswithcode.co
             </a>
           </div>
+        )}
+        {dictation.error && (
+          <div className="chat-paper-mention-message" role="alert">{dictation.error}</div>
         )}
         {mentions.message && (
           <div id="ask-home-paper-mention-message" className="chat-paper-mention-message" role="alert">
@@ -300,6 +339,26 @@ export const AskAssistant: React.FC = () => {
 type FeedMode = "trending" | "following";
 
 const FEED_PAGE_SIZE = 30;
+// The trending feed shows the follow invitation after this many papers.
+const FOLLOW_CARD_AFTER = 6;
+// When the account last opened its following feed, in this browser.
+const FOLLOWING_SEEN_KEY = "pwc:following-last-seen";
+
+function readFollowingSeen(): string | null {
+  try {
+    return localStorage.getItem(FOLLOWING_SEEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeFollowingSeen() {
+  try {
+    localStorage.setItem(FOLLOWING_SEEN_KEY, new Date().toISOString());
+  } catch {
+    // Without storage the tab simply shows no count.
+  }
+}
 const FOLLOWING_PAGE_SIZE = 40;
 
 interface FeedPage {
@@ -381,8 +440,10 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
     },
     { enabled: !following || !!user, initialPage: following ? 0 : 1 },
   );
-  const follows = useResearchFollows(following);
-  const topics = useResearchTopics(following, 10000);
+  // The trending tab reads these too, to invite accounts without follows and count new papers.
+  const follows = useResearchFollows();
+  const topics = useResearchTopics(true, 10000);
+  const hasFeed = !!follows.data?.length || !!topics.data?.length;
   const topicName = topicTitle;
   const building = topics.data?.filter(isTopicBuilding) ?? [];
   const topicBuilding = building.length > 0;
@@ -408,6 +469,18 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
   const noFollows = following && !!user && follows.data?.length === 0 && topics.isSuccess && topics.data.length === 0;
   const showIntro = (following && !auth?.isLoading && !user) || noFollows;
   const canBuildFeed = !!user || !isAuthDisabled();
+  const showFollowCard = !following && canBuildFeed && !auth?.isLoading
+    && (!user || (follows.isSuccess && topics.isSuccess && !hasFeed));
+  // "following · N new" counts papers added since the following feed was last opened here.
+  const [followingSeen] = useState(readFollowingSeen);
+  useEffect(() => {
+    if (user && (following || (hasFeed && !followingSeen))) writeFollowingSeen();
+  }, [user, following, hasFeed, followingSeen]);
+  const newCount = useQuery({
+    ...researchQueries.followingNewCount(user?.hf_subject, followingSeen ?? ""),
+    enabled: !following && !!user && hasFeed && !!followingSeen,
+  });
+  const newPapers = following ? 0 : newCount.data?.count ?? 0;
   // The pop-up opens on its own only when the intro first shows to a visitor who arrived without follows:
   // not after a removal, and not while saving what a guest picked before signing in, which may finish
   // before follows reload. It lives here rather than in the intro so it stays open once the first save lands.
@@ -545,7 +618,9 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
               <div className="paper-feed-toolbar-controls">
                 <div className="sort-options">
                   <button className={`sort-btn ${mode === "trending" ? "active" : ""}`} onClick={() => showTab("/")}>trending</button>
-                  <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => showTab("/following")}>following</button>
+                  <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => showTab("/following")}>
+                    following{newPapers > 0 && <span className="feed-tab-count">{newPapers >= 100 ? "99+" : newPapers} new</span>}
+                  </button>
                 </div>
               </div>
               <PaperDateFilter
@@ -637,6 +712,8 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
                 cards={cards}
                 skeleton="card"
                 rootMargin="400px"
+                cardHeader={showFollowCard ? (index) => index === FOLLOW_CARD_AFTER
+                  && <HomeFollowCard onBuild={() => setEditingTopic(null)} /> : undefined}
                 empty={error ? null : filteredTopic ? <>No papers about this topic match these filters. Widen the date range or <button type="button" className="link-button" onClick={() => setEditingTopic(filteredTopic.id)}>edit the topic</button>.</> : filtering ? <>No papers match the selected bubbles in this window. Widen the date range or pick more bubbles.</> : topicOnly ? <>No papers about your topics match these filters. Widen the date range or follow more topics.</> : following ? <>No papers from your topics or follows match these filters. Widen the date range, or follow more from <Link to="/tasks">tasks</Link>, <Link to="/methods">methods</Link>, benchmark, author, or organization pages.</> : "No papers in this window."}
               />
             )}
