@@ -507,6 +507,22 @@ it('shows the feed for an account that follows only a topic', async () => {
   expect(await screen.findByText('A paper')).toBeInTheDocument();
   expect(screen.queryByRole('heading', { name: 'Build your personal research feed' })).not.toBeInTheDocument();
 });
+it('names only the building topics the selected bubbles show', async () => {
+  vi.mocked(researchApi.topics).mockResolvedValue([
+    { ...topic, status: 'running', judged: 200, total: 4700 },
+    { ...topic, id: 2, text: 'speculative decoding', status: 'done' },
+  ]);
+  renderFeed('/following?topic=2');
+  expect(await screen.findByText('A paper')).toBeInTheDocument();
+  expect(screen.queryByText(/Showing the closest papers/)).not.toBeInTheDocument();
+  cleanup();
+  renderFeed('/following?follow=task:1');
+  expect(await screen.findByText('A paper')).toBeInTheDocument();
+  expect(screen.queryByText(/Showing the closest papers/)).not.toBeInTheDocument();
+  cleanup();
+  renderFeed('/following?topic=1&topic=2');
+  expect(await screen.findByText(/Showing the closest papers about \u201cReal-time video generation\u201d now/)).toBeInTheDocument();
+});
 it('has no separate trending (X) tab: X likes are part of the trending score', async () => {
   renderFeed('/');
   expect(await screen.findByRole('button', { name: 'trending' })).toHaveClass('active');
@@ -593,18 +609,34 @@ it('keeps the trending card dismissed', async () => {
   await screen.findByText('Trending 8');
   expect(screen.queryByRole('region', { name: 'Get a feed for your research' })).not.toBeInTheDocument();
 });
-it('counts new following papers on the tab since the last visit, and not the invitation', async () => {
+it('badges the following tab New when papers arrived since the last visit, and not the invitation', async () => {
   localStorage.setItem('pwc:following-last-seen', '2026-11-09T08:00:00.000Z');
   vi.mocked(researchApi.followingNewCount).mockResolvedValue({ count: 12 });
   vi.mocked(papersApi.list).mockResolvedValue({ count: 8, results: trendingPapers, next_page: null, previous_page: null });
   renderFeed('/');
-  const tab = await screen.findByRole('button', { name: 'following 12 new' });
+  const tab = await screen.findByRole('button', { name: 'following New' });
   expect(researchApi.followingNewCount).toHaveBeenCalledWith('2026-11-09T08:00:00.000Z');
   expect(screen.queryByRole('region', { name: 'Get a feed for your research' })).not.toBeInTheDocument();
   fireEvent.click(tab);
   await screen.findByText('A paper');
   expect(screen.getByRole('button', { name: 'following' })).toBeInTheDocument();
   expect(localStorage.getItem('pwc:following-last-seen')).not.toBe('2026-11-09T08:00:00.000Z');
+});
+it('marks papers added since the last visit without a banner', async () => {
+  localStorage.setItem('pwc:following-last-seen', '2026-11-09T08:00:00.000Z');
+  vi.mocked(researchApi.followingNewCount).mockResolvedValue({ count: 1 });
+  const entry = (id: string, title: string, added_at: string) => ({ paper: { ...paper, id, title }, paper_key: `paper:${id}`,
+    title, url: `/paper/${id}`, summary: '', published: paper.published, reasons: ['Task'], scores: [], added_at });
+  vi.mocked(researchApi.following).mockResolvedValue([
+    entry('1', 'Old paper', '2026-11-08T08:00:00Z'), entry('2', 'Fresh paper', '2026-11-10T08:00:00Z'),
+  ]);
+  const { container } = renderFeed();
+  await screen.findByText('Fresh paper');
+  const chips = [...container.querySelectorAll('.paper-card')].map(card => !!card.querySelector('.paper-new-chip'));
+  expect(chips).toEqual([false, true]);
+  expect(screen.queryByText(/since your last visit/)).not.toBeInTheDocument();
+  // The tab drops its badge once Following is open.
+  expect(screen.getByRole('button', { name: 'following' })).toBeInTheDocument();
 });
 it('starts counting from the first homepage visit', async () => {
   renderFeed('/');

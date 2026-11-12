@@ -362,7 +362,7 @@ function writeFollowingSeen() {
 const FOLLOWING_PAGE_SIZE = 40;
 
 interface FeedPage {
-  results: { paper: Paper; reasons?: string[] }[];
+  results: { paper: Paper; reasons?: string[]; added_at?: string | null }[];
   next_page: number | null;
 }
 
@@ -413,7 +413,7 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
   // Sidebar: tasks whose share of recent papers is rising vs their baseline.
   // Independent of Top Domains; overlapping entries appear in both sections
   // so neither list misrepresents its own signal.
-  const trendingTasks = useQuery(catalogQueries.trendingTasks({ limit: 8, level: 0, min_recent_papers: 10 }));
+  const trendingTasks = useQuery(catalogQueries.trendingTasks({ limit: 8, min_recent_papers: 10 }));
 
   const topicOnly = following && searchParams.get("only") === "topic";
   const activeFilter: FeedFilter = following ? {
@@ -446,7 +446,9 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
   const hasFeed = !!follows.data?.length || !!topics.data?.length;
   const topicName = topicTitle;
   const building = topics.data?.filter(isTopicBuilding) ?? [];
-  const topicBuilding = building.length > 0;
+  // The note names only the building topics the selected bubbles show.
+  const shownBuilding = building.filter(topic => activeFilter.topicIds.length
+    ? activeFilter.topicIds.includes(topic.id) : !activeFilter.follows.length);
   // The one selected topic, when it is the only bubble selected.
   const filteredTopic = activeFilter.topicIds.length === 1 && !activeFilter.follows.length
     ? topics.data?.find(topic => topic.id === activeFilter.topicIds[0]) : undefined;
@@ -471,7 +473,7 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
   const canBuildFeed = !!user || !isAuthDisabled();
   const showFollowCard = !following && canBuildFeed && !auth?.isLoading
     && (!user || (follows.isSuccess && topics.isSuccess && !hasFeed));
-  // "following · N new" counts papers added since the following feed was last opened here.
+  // The "New" badge on the following tab: papers added since the following feed was last opened here.
   const [followingSeen] = useState(readFollowingSeen);
   useEffect(() => {
     if (user && (following || (hasFeed && !followingSeen))) writeFollowingSeen();
@@ -481,6 +483,8 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
     enabled: !following && !!user && hasFeed && !!followingSeen,
   });
   const newPapers = following ? 0 : newCount.data?.count ?? 0;
+  // Read before this visit overwrites it, so Following can mark what arrived since.
+  const markNewAfter = following && followingSeen ? Date.parse(followingSeen) : NaN;
   // The pop-up opens on its own only when the intro first shows to a visitor who arrived without follows:
   // not after a removal, and not while saving what a guest picked before signing in, which may finish
   // before follows reload. It lives here rather than in the intro so it stays open once the first save lands.
@@ -535,9 +539,13 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
   }, [user, followPendingTopics]);
   const cards = useMemo<PaperFeedCard[]>(
     () => infinite.data?.pages.flatMap((page) =>
-      page.results.map((entry) => ({ ...transformPaperForCard(entry.paper), followReasons: entry.reasons })),
+      page.results.map((entry) => ({
+        ...transformPaperForCard(entry.paper),
+        followReasons: entry.reasons,
+        isNew: !!entry.added_at && Date.parse(entry.added_at) > markNewAfter,
+      })),
     ) ?? [],
-    [infinite.data],
+    [infinite.data, markNewAfter],
   );
 
   const error = infinite.error;
@@ -619,7 +627,7 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
                 <div className="sort-options">
                   <button className={`sort-btn ${mode === "trending" ? "active" : ""}`} onClick={() => showTab("/")}>trending</button>
                   <button className={`sort-btn ${following ? "active" : ""}`} onClick={() => showTab("/following")}>
-                    following{newPapers > 0 && <span className="feed-tab-count">{newPapers >= 100 ? "99+" : newPapers} new</span>}
+                    following{newPapers > 0 && <span className="nav-new-badge feed-tab-new" title="New papers since your last visit">New</span>}
                   </button>
                 </div>
               </div>
@@ -674,9 +682,9 @@ export const HomeFeed: React.FC<{ mode: FeedMode }> = ({ mode }) => {
               </Alert>
             )}
 
-            {following && topicBuilding && (
+            {following && shownBuilding.length > 0 && (
               <div className="following-topic-note" role="status">
-                Showing the closest papers about {building.map(topic => `“${topicName(topic)}”`).join(" and ")} now. A model is reading papers to refine these matches, which takes a few minutes.
+                Showing the closest papers about {shownBuilding.map(topic => `“${topicName(topic)}”`).join(" and ")} now. A model is reading papers to refine these matches, which takes a few minutes.
               </div>
             )}
 
