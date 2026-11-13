@@ -434,6 +434,15 @@ COMMANDS: dict[str, Job] = {
             "validated swe-marathon.org results bundle; never creates papers"
         ),
     ),
+    "sync_jevbench": job(
+        "-m",
+        "scripts.hourly.sync_jevbench",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed JevBench evaluation rows from Benchmark "
+            "Heaven's validated API board; never creates papers"
+        ),
+    ),
     "sync_frontiercs_2": job(
         "-m",
         "scripts.hourly.sync_frontiercs_2",
@@ -644,7 +653,9 @@ COMMANDS: dict[str, Job] = {
         timeout="30m",
         idempotency=(
             "list is read-only; record inserts one x_insight_posts row per "
-            "posted subject, called once by the X agent after each post"
+            "posted subject, called once by the X agent after each post; "
+            "requests closes requests for already-posted papers; "
+            "resolve-request closes one x_post_requests row"
         ),
         health_job="x_post_candidates",
     ),

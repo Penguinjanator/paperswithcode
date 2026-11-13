@@ -108,7 +108,7 @@ class ChatModelSettings(BaseModel):
 class ChatOpenAIBudgetSettings(BaseModel):
     """Direct-OpenAI pricing, allowances, and rate limits."""
 
-    chat_openai_pricing_verified_at: str = Field(default="2026-10-19")
+    chat_openai_pricing_verified_at: str = Field(default="2026-11-12")
     chat_openai_pricing_max_age_days: int = Field(default=30, ge=1, le=90)
     chat_openai_input_microusd_per_million_tokens: int = Field(default=100_000, ge=1)
     chat_openai_cached_input_microusd_per_million_tokens: int = Field(
@@ -445,6 +445,17 @@ class ChatArtifactSettings(BaseModel):
     chat_artifact_preview_max_pixels: int = Field(
         default=20_000_000, ge=1_000_000, le=20_000_000
     )
+    # User-uploaded chat files (direct Luna only). Our copy lives in a private
+    # bucket for chat-health audits; OpenAI holds the copy the model reads.
+    chat_file_uploads_enabled: bool = Field(default=False)
+    chat_file_storage_backend: Literal["local", "hf_bucket"] = Field(default="local")
+    chat_file_hf_bucket_id: str = Field(default="", max_length=255)
+    chat_file_local_dir: str = Field(default="/var/lib/paperswithcode/chat-files")
+    chat_file_max_bytes: int = Field(
+        default=20 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024
+    )
+    chat_file_max_pdf_pages: int = Field(default=100, ge=1, le=100)
+    chat_file_max_per_session: int = Field(default=5, ge=1, le=5)
     chat_posterly_timeout_seconds: float = Field(default=600, ge=60, le=600)
     chat_posterly_max_tool_rounds: int = Field(default=20, ge=8, le=20)
     chat_posterly_max_tool_calls: int = Field(default=40, ge=12, le=40)

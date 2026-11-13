@@ -968,7 +968,8 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
               WHERE d.slug IN (
                     'artificial-analysis-intelligence-index',
                     'artificial-analysis-agentic-index',
-                    'artificial-analysis-provider-voice-tts-arena'
+                    'artificial-analysis-provider-voice-tts-arena',
+                    'artificial-analysis-decision-index'
                   )
                 AND (
                     (
@@ -986,6 +987,12 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                       AND e.methodology LIKE
                           'Managed by the Papers with Code Artificial Analysis TTS live sync.%'
                     )
+                    OR
+                    (
+                      e.best_metric = 'Score'
+                      AND e.methodology LIKE
+                          'Managed by the Papers with Code Artificial Analysis Decision Index live sync.%'
+                    )
                   )
             )
             SELECT max(updated_at) AS last_write,
@@ -997,7 +1004,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                      WHERE updated_at IS NULL
                         OR updated_at <= now() - interval '3 hours'
                    ) AS stale_evaluations,
-                   3 - count(DISTINCT dataset_slug) FILTER (
+                   4 - count(DISTINCT dataset_slug) FILTER (
                      WHERE updated_at > now() - interval '3 hours'
                    ) AS missing_fresh_datasets
             FROM managed_evaluations
@@ -1274,6 +1281,42 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                   'Managed by the Papers with Code Abundant AI SWE-Marathon live sync.%'
         """,
         workflow_file="cron-sync-swe-marathon.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_jevbench",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(60, offset_minutes=37),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-jevbench.timer",
+        systemd_service="pwc-cron-sync-jevbench.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync JevBench Leaderboard (Benchmark Heaven)",
+        category="hourly",
+        schedule="37 * * * * (hourly)",
+        script_path="hourly/sync_jevbench.py",
+        log_name="sync_jevbench",
+        process_patterns=("scripts.hourly.sync_jevbench",),
+        lock_file=("/var/lib/paperswithcode/production/cron-locks/sync_jevbench.lock"),
+        expected_runtime_minutes=5,
+        stale_after_minutes=150,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '2 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'jevbench'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code Benchmark Heaven JevBench live sync.%'
+        """,
+        workflow_file="cron-sync-jevbench.yml",
         workflow_jobs=("run",),
         dashboard_group="leaderboard_sync",
     ),

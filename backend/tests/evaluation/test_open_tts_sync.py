@@ -46,6 +46,7 @@ from backend.services.open_tts_sync_service import (
     parse_open_tts_leaderboard,
 )
 from backend.tests.evaluation.model_evidence import add_release_evidence
+from backend.services.leaderboard_model_matching_service import MatchedModel
 
 
 @compiles(BigInteger, "sqlite")
@@ -199,30 +200,20 @@ def test_fetch_rejects_nondefault_or_missing_filter_echoes():
         raise AssertionError("missing filter echoes were accepted")
 
 
-def test_fetches_english_and_every_available_language_view():
-    all_languages = [
-        "🇬🇧 English",
-        "🇨🇳 Chinese",
-        "🇫🇷 French",
-        "🇪🇸 Spanish",
-        "🇩🇪 German",
-        "🇮🇹 Italian",
-        "🇯🇵 Japanese",
-        "🇰🇷 Korean",
-        "🇷🇺 Russian",
-    ]
-    choices = [[language, language] for language in all_languages]
+def test_fetches_english_core_language_and_per_language_views():
+    languages = [*tts.CORE_LANGUAGES, "🇭🇰 Cantonese", *tts.LANGUAGE_BOARDS]
+    choices = [[language, language] for language in dict.fromkeys(languages)]
     multilingual_payload = _payload()
     for row in multilingual_payload["data"][5:]:
         row[0] = None
         row[2] = None
         row[3] = None
+    requested = []
 
     class FakeClient:
         def __init__(self, url, *, verbose):
             assert url == SPACE_APP_URL
             assert verbose is False
-            self.calls = 0
 
         def predict(self, *, version, search, langs, datasets, clone, api_name):
             assert (version, search, datasets, clone, api_name) == (
@@ -232,21 +223,23 @@ def test_fetches_english_and_every_available_language_view():
                 False,
                 "/partial",
             )
-            self.calls += 1
-            if self.calls == 1:
-                assert langs == [DEFAULT_LANGUAGE]
+            requested.append(langs)
+            if langs == [DEFAULT_LANGUAGE]:
                 return _response(_payload(), language_choices=choices)
-            assert langs == all_languages
-            return _response(
-                multilingual_payload,
-                language=all_languages,
-                language_choices=choices,
-            )
+            if langs == list(tts.CORE_LANGUAGES):
+                payload = multilingual_payload
+            else:
+                payload = _payload(4)
+            return _response(payload, language=langs, language_choices=choices)
 
     leaderboards = tts.fetch_open_tts_leaderboards(FakeClient)
 
+    assert set(leaderboards) == set(tts.METHODOLOGY_BY_DATASET)
     assert len(leaderboards[tts.DATASET_SLUG]) == 15
     assert len(leaderboards[tts.ALL_LANGUAGE_DATASET_SLUG]) == 5
+    assert len(leaderboards["open-tts-leaderboard-hindi"]) == 4
+    assert ["🇮🇳 Hindi"] in requested
+    assert ["🇭🇰 Cantonese"] not in requested
 
 
 def test_parser_rejects_truncated_or_noncontiguous_data():
@@ -418,6 +411,7 @@ def test_sync_is_idempotent_and_only_replaces_managed_rows(monkeypatch):
         "deleted": 2,
         "auto_matched": [],
         "excluded_models": ["org/unreviewed"],
+        "no_paper_models": [],
         "missing_papers": [],
     }
     assert (second.created, second.updated, second.deleted) == (0, 1, 0)
@@ -443,7 +437,7 @@ def test_unknown_models_match_announcements_or_become_radar_signals(monkeypatch)
             id=10,
             title="Introducing Echo TTS 2",
             source="external",
-            source_url="https://example.com/echo-tts-2",
+            source_url="https://example.com/echo-tts-2.pdf",
             version="v1",
             is_latest_version=True,
         )
@@ -483,6 +477,91 @@ def test_unknown_models_match_announcements_or_become_radar_signals(monkeypatch)
     signal = session.query(ModelReleaseSignal).one()
     assert (signal.lab, signal.model_name) == ("voice-lab", "Voice 9")
     assert signal.sightings == 2
+
+
+def test_models_without_a_paper_stay_off_the_board(monkeypatch):
+    session = _session()
+    monkeypatch.setattr(tts, "MODEL_PAPER_IDENTITIES", {})
+    papers = {
+        10: ("Ming-3.0-tts", "https://github.com/inclusionAI/Ming-3.0-tts"),
+        11: ("Introducing Echo TTS 2", "https://example.com/blog/echo-tts-2"),
+        12: ("Wave 3 Technical Report", "https://example.com/wave-3"),
+    }
+    for paper_id, (title, source_url) in papers.items():
+        session.add(
+            Paper(
+                id=paper_id,
+                title=title,
+                source="external",
+                source_url=source_url,
+                version="v1",
+                is_latest_version=True,
+            )
+        )
+        add_release_evidence(session, paper_id)
+    session.commit()
+    english = [
+        OpenTtsEntry(
+            "inclusionAI/Ming-3.0-tts-0.5B",
+            "inclusionAI/Ming-3.0-tts-0.5B",
+            1,
+            1.0,
+            20.0,
+            True,
+        ),
+        OpenTtsEntry("echo-lab/echo-tts-2", "Echo TTS 2", 2, 1.5, 20.0, True),
+        OpenTtsEntry("wave-lab/Wave-3", "wave-lab/Wave-3", 3, 2.0, 20.0, True),
+    ]
+    matched = {
+        "inclusionAI/Ming-3.0-tts-0.5B": MatchedModel(
+            10, "inclusionAI/Ming-3.0-tts-0.5B", True
+        ),
+        "Echo TTS 2": MatchedModel(11, "Echo TTS 2", True),
+        "wave-lab/Wave-3": MatchedModel(12, "wave-lab/Wave-3", True),
+    }
+    monkeypatch.setattr(
+        tts.LeaderboardModelMatcher, "match", lambda _self, _models: matched
+    )
+
+    stats = OpenTtsSyncService(session).sync(
+        english,
+        discovery=ArtificialAnalysisDiscovery(papers={}),
+        fetched_at=datetime(2026, 11, 12, tzinfo=UTC),
+    )
+
+    assert stats.no_paper_models == [
+        "inclusionAI/Ming-3.0-tts-0.5B",
+        "echo-lab/echo-tts-2",
+    ]
+    row = session.query(Evaluation).one()
+    assert (row.paper_id, row.model_name) == (12, "Wave-3")
+    assert session.query(PaperTask).one().paper_id == 12
+
+
+def test_has_paper_and_display_model_name():
+    assert tts.has_paper(Paper(source="arxiv", arxiv_id="2601.00001"))
+    assert tts.has_paper(
+        Paper(source="external", source_url="https://x.org/report.pdf?dl=1")
+    )
+    assert tts.has_paper(
+        Paper(
+            source="external",
+            title="Inflect v2",
+            source_url="https://github.com/o/i/blob/main/docs/TECHNICAL_REPORT.md",
+        )
+    )
+    assert not tts.has_paper(
+        Paper(
+            source="external",
+            title="Kokoro-82M",
+            source_url="https://huggingface.co/hexgrad/Kokoro-82M",
+        )
+    )
+    assert (
+        tts.display_model_name("inclusionAI/Ming-3.0-tts-0.5B") == "Ming-3.0-tts-0.5B"
+    )
+    assert tts.display_model_name("org/model-3 (variant)") == "model-3 (variant)"
+    assert tts.display_model_name("Echo TTS 2") == "Echo TTS 2"
 
 
 def test_sync_rolls_back_dry_run(monkeypatch):
@@ -534,7 +613,7 @@ def test_syncs_english_and_all_language_benchmarks(monkeypatch):
     assert rows[tts.DATASET_SLUG].metrics == {"WER": 1.25, "RTFx": 12.5}
     multilingual = rows[tts.ALL_LANGUAGE_DATASET_SLUG]
     assert multilingual.metrics == {"WER": 3.5, "RTFx": 10.0}
-    assert "all available languages" in multilingual.methodology
+    assert "9 Seed-TTS and CV3-Eval languages" in multilingual.methodology
     assert multilingual.best_rank == 1
 
 
@@ -681,13 +760,22 @@ def test_setup_creates_english_and_all_language_benchmarks(monkeypatch):
     setup.main()
 
     datasets = {dataset.slug: dataset for dataset in session.query(Dataset).all()}
-    assert set(datasets) == {
-        tts.DATASET_SLUG,
-        tts.ALL_LANGUAGE_DATASET_SLUG,
-    }
+    assert set(datasets) == set(tts.METHODOLOGY_BY_DATASET)
+    assert len(datasets) == 23
     assert all(dataset.introducing_paper_id == 9 for dataset in datasets.values())
-    assert session.query(TaskDataset).count() == 2
-    assert session.query(TaskDatasetMetric).count() == 4
+    hindi = datasets["open-tts-leaderboard-hindi"]
+    assert hindi.name == "Open TTS Leaderboard (Hindi)"
+    english = datasets[tts.DATASET_SLUG]
+    assert english.parent_dataset_id is None
+    assert {
+        dataset.parent_dataset_id
+        for slug, dataset in datasets.items()
+        if slug != tts.DATASET_SLUG
+    } == {english.id}
+    assert hindi.url == f"{SPACE_SOURCE_URL}?languages=hi"
+    assert datasets[tts.DATASET_SLUG].url == SPACE_SOURCE_URL
+    assert session.query(TaskDataset).count() == 23
+    assert session.query(TaskDatasetMetric).count() == 46
 
 
 def test_cron_syncs_both_open_tts_views(monkeypatch):

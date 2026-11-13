@@ -20,11 +20,15 @@ from backend.services.external_resource_service import (
 )
 from backend.services.open_tts_sync_service import (
     ALL_LANGUAGE_DATASET_SLUG,
+    CORE_LANGUAGES,
     DATASET_SLUG,
+    LANGUAGE_BOARDS,
     RTFX_METRIC,
     SPACE_SOURCE_URL,
     TASK_SLUG,
     WER_METRIC,
+    language_dataset_slug,
+    language_name,
 )
 
 logging.basicConfig(
@@ -34,25 +38,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NAME = "Open TTS Leaderboard"
+DATASETS = "Seed-TTS, CV3-Eval, and MiniMax Multilingual"
 DESCRIPTION = (
     "The Hugging Face Open TTS Leaderboard compares open text-to-speech models "
     "on intelligibility and generation speed. This benchmark mirrors its "
-    "default comparable view: English macro-averages across Seed-TTS and "
-    "CV3-Eval without voice cloning."
+    f"default comparable view: English macro-averages across {DATASETS} "
+    "without voice cloning."
 )
-SHORT_DESCRIPTION = (
-    "Open TTS models ranked by English WER and RTFx on Seed-TTS and CV3-Eval."
-)
-ALL_LANGUAGE_NAME = "Open TTS Leaderboard — All Languages Average"
+SHORT_DESCRIPTION = f"Open TTS models ranked by English WER and RTFx on {DATASETS}."
+CORE_LANGUAGE_NAMES = ", ".join(language_name(label) for label in CORE_LANGUAGES)
+# Variant names end in "(<qualifier>)": the task page lists them as chips
+# labelled by that qualifier under the English board.
+ALL_LANGUAGE_NAME = f"Open TTS Leaderboard ({len(CORE_LANGUAGES)}-language average)"
 ALL_LANGUAGE_DESCRIPTION = (
     "The multilingual view of the Hugging Face Open TTS Leaderboard compares "
     "open text-to-speech models using macro-average intelligibility and "
-    "generation speed across every language currently exposed by the Space, "
-    "on Seed-TTS and CV3-Eval without voice cloning."
+    f"generation speed across the {len(CORE_LANGUAGES)} languages that Seed-TTS "
+    f"and CV3-Eval cover ({CORE_LANGUAGE_NAMES}), on {DATASETS} without voice "
+    "cloning. Languages covered only by MiniMax have their own boards."
 )
 ALL_LANGUAGE_SHORT_DESCRIPTION = (
-    "Open TTS models ranked by average WER and RTFx across all available languages."
+    f"Open TTS models ranked by average WER and RTFx across "
+    f"{len(CORE_LANGUAGES)} languages."
 )
+
+
+def _language_benchmark(label: str) -> tuple[str, str, str, str]:
+    language = language_name(label)
+    return (
+        language_dataset_slug(label),
+        f"Open TTS Leaderboard ({language})",
+        (
+            "The per-language view of the Hugging Face Open TTS Leaderboard "
+            f"ranks open text-to-speech models on {language} intelligibility "
+            f"and generation speed, macro-averaged across the {DATASETS} sets "
+            f"that cover {language}, without voice cloning."
+        ),
+        f"Open TTS models ranked by {language} WER and RTFx.",
+    )
+
+
 BENCHMARKS = (
     (DATASET_SLUG, NAME, DESCRIPTION, SHORT_DESCRIPTION),
     (
@@ -61,7 +86,11 @@ BENCHMARKS = (
         ALL_LANGUAGE_DESCRIPTION,
         ALL_LANGUAGE_SHORT_DESCRIPTION,
     ),
+    *(_language_benchmark(label) for label in LANGUAGE_BOARDS),
 )
+DEEPLINK_CODES = {
+    language_dataset_slug(label): code for label, code in LANGUAGE_BOARDS.items()
+}
 SOURCE_TITLE = "Open TTS Leaderboard"
 # The formal citation declares only 2026; use the Space's public createdAt date
 # rather than inventing a January publication date.
@@ -112,6 +141,7 @@ def main() -> None:
             metrics[name] = metric
 
         dataset_ids: list[int] = []
+        parent: Dataset | None = None
         for slug, name, description, short_description in BENCHMARKS:
             dataset = session.query(Dataset).filter(Dataset.slug == slug).one_or_none()
             if dataset is None:
@@ -121,9 +151,16 @@ def main() -> None:
                 logger.info("Created dataset %r (id=%s)", dataset.name, dataset.id)
             dataset.name = name
             dataset.full_name = name
+            if parent is None:
+                parent = dataset  # BENCHMARKS lists the English board first.
+            else:
+                dataset.parent_dataset_id = parent.id
+                dataset.variant_type = "subset"
             dataset.description = description
             dataset.short_description = short_description
             dataset.url = SPACE_SOURCE_URL
+            if (code := DEEPLINK_CODES.get(slug)) is not None:
+                dataset.url = f"{SPACE_SOURCE_URL}?languages={code}"
             dataset.hf_url = SPACE_SOURCE_URL
             dataset.homepage = SPACE_SOURCE_URL
             dataset.paper_url = _paper_url(source_paper)
