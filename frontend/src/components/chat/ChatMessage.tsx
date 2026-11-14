@@ -20,7 +20,7 @@ import { CheckIcon, Chevron, SearchIcon, Spinner } from "@/components/chat/icons
 import { usePaperMentions } from "@/components/chat/usePaperMentions";
 import { PaperPreviewLink } from "@/components/paper-preview/PaperPreviewLink";
 import { authorsLine, excerpt, venueLine } from "@/components/chat/paperDisplay";
-import { CHAT_PROGRESS_LABELS } from "@/lib/chat";
+import { CHAT_PROGRESS_LABELS, formatFileSize, withoutSelection } from "@/lib/chat";
 import type {
   AnswerBlock,
   AppBlock,
@@ -28,6 +28,7 @@ import type {
   ChatCitation,
   ChatPaperHit,
   ChatDraft,
+  ChatUploadedFile,
   PaperMentionDraft,
   PaperSelectionDraft,
   ReasoningBlock,
@@ -133,6 +134,15 @@ const InlinePaperMentions: React.FC<{
   return <>{pieces}</>;
 };
 
+/** "Thought for 12 seconds" when this tab timed the reasoning; history has no timing. */
+const reasoningDoneLabel = ({ startedAt, endedAt }: ReasoningBlock): string => {
+  if (startedAt === undefined || endedAt === undefined) return "Thought for a few seconds";
+  const seconds = Math.max(1, Math.round((endedAt - startedAt) / 1_000));
+  if (seconds < 60) return `Thought for ${seconds} second${seconds === 1 ? "" : "s"}`;
+  const remainder = seconds % 60;
+  return `Thought for ${Math.floor(seconds / 60)}m${remainder ? ` ${remainder}s` : ""}`;
+};
+
 const ReasoningBlockView: React.FC<{
   block: ReasoningBlock;
   papers: Record<string, ChatPaperHit>;
@@ -168,7 +178,7 @@ const ReasoningBlockView: React.FC<{
         aria-expanded={block.open}
       >
         <CheckIcon />
-        <span>Thought for a few seconds</span>
+        <span>{reasoningDoneLabel(block)}</span>
         <Chevron open={block.open} />
       </button>
       {block.open && (
@@ -424,7 +434,7 @@ const MentionUserEditor: React.FC<UserEditorProps & { paperMentions: PaperMentio
         <PaperSelectionCard
           selection={value.paperSelection}
           editable
-          onRemove={() => setValue({ text: value.text, paperMentions: value.paperMentions })}
+          onRemove={() => setValue(withoutSelection(value))}
         />
       )}
       <div className="chat-inline-editor-textarea-wrap">
@@ -453,6 +463,7 @@ export const UserMessage: React.FC<{
   text: string;
   paperMentions?: PaperMentionDraft[];
   paperSelection?: PaperSelectionDraft;
+  attachedFiles?: ChatUploadedFile[];
   paperMentionsEnabled?: boolean;
   isInitial?: boolean;
   editingAllowed?: boolean;
@@ -467,6 +478,7 @@ export const UserMessage: React.FC<{
   text,
   paperMentions = [],
   paperSelection,
+  attachedFiles = [],
   paperMentionsEnabled = false,
   editingAllowed = false,
   editing = false,
@@ -506,6 +518,16 @@ export const UserMessage: React.FC<{
     <div className="chat-msg chat-msg-user" data-message-id={id}>
       <div className="chat-user-message-wrap">
         {paperSelection && <PaperSelectionCard selection={paperSelection} />}
+        {attachedFiles.length > 0 && (
+          <ul className="chat-message-files" aria-label="Attached files">
+            {attachedFiles.map((file) => (
+              <li key={file.id} className="chat-file-chip">
+                <span className="chat-file-chip-name" title={file.filename}>{file.filename}</span>
+                <span className="chat-file-chip-size">{formatFileSize(file.size_bytes)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="chat-bubble" onDoubleClick={selectDoubleClickedWord}>
           <InlinePaperMentions text={text} mentions={paperMentions} />
         </div>

@@ -29,7 +29,7 @@ const SharedTranscript: React.FC<{ detail: ChatShareDetail }> = ({ detail }) => 
   return (
     <div className="shared-chat-transcript">
       {messages.map((message) => message.role === "user"
-        ? <UserMessage key={message.id} id={message.id} text={message.text ?? ""} paperMentions={message.paperMentions ?? []} paperSelection={message.paperSelection} />
+        ? <UserMessage key={message.id} id={message.id} text={message.text ?? ""} paperMentions={message.paperMentions ?? []} paperSelection={message.paperSelection} attachedFiles={message.attachedFiles} />
         : <AssistantMessage key={message.id} msg={message} papers={papers} onToggleBlock={toggleBlock} />)}
     </div>
   );
@@ -122,7 +122,6 @@ const SharedChatView: React.FC = () => {
           {query.data.model_provider === "openrouter" && <span>
             Powered by <a href="https://openrouter.ai" target="_blank" rel="noreferrer">OpenRouter</a>
           </span>}
-          {query.data.model_provider === "openai" && <span>Powered by OpenAI</span>}
         </div>}
         <section className="shared-chat-fresh" aria-labelledby="shared-chat-fresh-title">
           <h2 id="shared-chat-fresh-title">Start a new conversation</h2>

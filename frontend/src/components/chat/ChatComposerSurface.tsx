@@ -12,6 +12,8 @@ interface ChatComposerSurfaceProps {
   /** Billed to Papers With Code, so the user billing notice does not apply. */
   sponsored?: boolean;
   paused: boolean;
+  /** Files are uploading; a suggestion would send before they are attached. */
+  uploading?: boolean;
   /** Why the last send was rejected; shown next to the restored draft. */
   error?: string;
   suggestions?: readonly string[];
@@ -25,6 +27,7 @@ export function ChatComposerSurface({
   provider,
   sponsored = false,
   paused,
+  uploading = false,
   error,
   suggestions = [],
   suggestionLinks,
@@ -51,13 +54,12 @@ export function ChatComposerSurface({
         type="button"
         key={example}
         className="chat-example"
-        disabled={paused}
+        disabled={paused || uploading}
+        // A suggestion replaces the typed text; selection and files still go with it.
         onClick={() => composerProps.onSend({
+          ...composerProps.draft,
           text: example,
           paperMentions: [],
-          ...(composerProps.draft?.paperSelection
-            ? { paperSelection: composerProps.draft.paperSelection }
-            : {}),
         })}
       >{example}</button>)}
       {suggestionLinks}
@@ -72,7 +74,6 @@ export function ChatComposerSurface({
         <div className="chat-composer-foot">{isChatLive() ? <>
           {provider === "huggingface" && <span className="chat-provider-attribution">Powered by 🤗 <a href="https://huggingface.co/docs/inference-providers/en/index" target="_blank" rel="noreferrer">Inference Providers</a>.</span>}
           {provider === "openrouter" && <span className="chat-provider-attribution">Powered by <a href="https://openrouter.ai" target="_blank" rel="noreferrer">OpenRouter</a>.</span>}
-          {provider === "openai" && <span className="chat-provider-attribution">Powered by OpenAI.</span>}
           <span>The AI assistant can make mistakes. Double-check responses.</span>
         </> : <>Assistant preview — responses are simulated.</>}</div>
       </div>

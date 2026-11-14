@@ -8,12 +8,15 @@ as the chat session; deleting the file or the chat deletes both.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
+import re
 import tempfile
 import unicodedata
 import uuid
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +27,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.config import Settings
-from backend.models.database import ChatSession, ChatUploadedFile
+from backend.models.database import ChatMessageRecord, ChatSession, ChatUploadedFile
+from backend.services.chat_provider_gateway.user_files import PLACEHOLDER, placeholder
 from backend.services.chat_file_probe import FileProbeError, count_pdf_pages, sniff
 from backend.services.chat_session_service import (
     ChatOwner,
@@ -114,12 +118,29 @@ class BucketChatFileStorage(ChatFileStorage):
             pass
 
 
+@functools.lru_cache(maxsize=4)
+def _bucket_storage(bucket_id: str, token: str | None) -> BucketChatFileStorage:
+    # One client per process keeps its connections and Xet session warm.
+    return BucketChatFileStorage(bucket_id, token)
+
+
 def chat_file_storage_from_settings(settings: Settings) -> ChatFileStorage:
     if settings.chat_file_storage_backend == "hf_bucket":
-        return BucketChatFileStorage(
+        return _bucket_storage(
             settings.chat_file_hf_bucket_id, settings.hf_token or None
         )
     return LocalChatFileStorage(Path(settings.chat_file_local_dir))
+
+
+def warm_chat_file_storage(settings: Settings) -> None:
+    """Open the bucket client at startup so the first upload is not the slow one."""
+    if settings.chat_file_storage_backend != "hf_bucket":
+        return
+    storage = chat_file_storage_from_settings(settings)
+    try:
+        storage.filesystem.info(storage._path("warmup"))
+    except FileNotFoundError:
+        pass
 
 
 class OpenAIFilesClient:
@@ -181,6 +202,25 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+USER_FILES_BLOCK = re.compile(r"\A<user_files>\n((?:[^\n]*\n)*?)</user_files>\n")
+
+
+def prompt_with_files(prompt: str, rows: list[ChatUploadedFile]) -> str:
+    """Prefix a turn prompt with one gateway placeholder line per file."""
+    if not rows:
+        return prompt
+    lines = "".join(f"{placeholder(row.id)}\n" for row in rows)
+    return f"<user_files>\n{lines}</user_files>\n{prompt}"
+
+
+def prompt_file_ids(prompt: str | None) -> list[uuid.UUID]:
+    """The files a stored turn prompt attached, in order."""
+    match = USER_FILES_BLOCK.match(prompt or "")
+    if match is None:
+        return []
+    return [uuid.UUID(found.group(1)) for found in PLACEHOLDER.finditer(match.group(1))]
+
+
 class ChatFileService:
     def __init__(
         self,
@@ -232,6 +272,75 @@ class ChatFileService:
                 .order_by(ChatUploadedFile.created_at)
             )
         )
+
+    def turn_files(
+        self,
+        owner: ChatOwner,
+        session_id: uuid.UUID | None,
+        file_ids: list[uuid.UUID],
+    ) -> list[ChatUploadedFile]:
+        """Validate the files a new turn attaches; they must be ready in its chat."""
+        if not file_ids:
+            return []
+        if not self.settings.chat_file_uploads_enabled:
+            raise ChatServiceError(
+                "file_uploads_disabled", 409, "File uploads are not available."
+            )
+        if session_id is None:
+            raise ChatServiceError(
+                "file_not_found", 404, "Upload files to this chat before sending."
+            )
+        session = self._owned_session(owner, session_id)
+        if session.selected_model != self.settings.chat_openai_luna_route:
+            raise ChatServiceError(
+                "file_upload_model_unsupported", 409, "File uploads need GPT-6 Luna"
+            )
+        wanted = list(dict.fromkeys(file_ids))
+        rows = {
+            row.id: row
+            for row in self.db.scalars(
+                select(ChatUploadedFile).where(
+                    ChatUploadedFile.session_id == session_id,
+                    ChatUploadedFile.id.in_(wanted),
+                    ChatUploadedFile.state == "ready",
+                )
+            )
+        }
+        if len(rows) != len(wanted):
+            raise ChatServiceError(
+                "file_not_found",
+                404,
+                "An attached file is no longer available. Remove it and retry.",
+            )
+        return [rows[file_id] for file_id in wanted]
+
+    def attachments(
+        self, messages: list[ChatMessageRecord]
+    ) -> dict[uuid.UUID, list[ChatUploadedFile]]:
+        """Files each user message attached, keyed by message id."""
+        if not self.settings.chat_file_uploads_enabled:
+            return {}
+        wanted = {
+            message.id: prompt_file_ids(message.effective_prompt)
+            for message in messages
+            if message.role == "user"
+        }
+        ids = {file_id for file_ids in wanted.values() for file_id in file_ids}
+        if not ids:
+            return {}
+        rows = {
+            row.id: row
+            for row in self.db.scalars(
+                select(ChatUploadedFile).where(
+                    ChatUploadedFile.id.in_(ids), ChatUploadedFile.state == "ready"
+                )
+            )
+        }
+        return {
+            message_id: [rows[file_id] for file_id in file_ids if file_id in rows]
+            for message_id, file_ids in wanted.items()
+            if file_ids
+        }
 
     def _lock_owner(self, owner: ChatOwner) -> None:
         """Serialize uploads with turn admission on the owner's quota key."""
@@ -333,14 +442,26 @@ class ChatFileService:
         storage_key = row.storage_key
         openai_file_id = None
         try:
-            self.storage.write(storage_key, data)
-            openai_file_id = self.openai_files.upload(name, data, kind.media_type)
+            # The two copies are independent, so write them at the same time;
+            # leaving the block waits for both before either outcome is used.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                stored = pool.submit(self.storage.write, storage_key, data)
+                uploaded = pool.submit(
+                    self.openai_files.upload, name, data, kind.media_type
+                )
+            if uploaded.exception() is None:
+                openai_file_id = uploaded.result()
+            failure = stored.exception() or uploaded.exception()
+            if failure is not None:
+                raise failure
             # Record the OpenAI id at once: it is the only handle that can
             # delete that copy. If the chat was deleted meanwhile, this fails.
             row.openai_file_id = openai_file_id
             row.state = "ready"
             self.db.commit()
-        except (httpx.HTTPError, OSError, ValueError, SQLAlchemyError) as error:
+        except Exception as error:
+            # Either side may have finished while the other failed in any way,
+            # so the copies are always removed before the error moves on.
             self.db.rollback()
             self._discard(
                 FileCleanup(
@@ -352,9 +473,13 @@ class ChatFileService:
                 delete(ChatUploadedFile).where(ChatUploadedFile.id == file_id)
             )
             self.db.commit()
-            raise ChatServiceError(
-                "file_upload_failed", 502, "The file could not be stored; try again"
-            ) from error
+            if isinstance(
+                error, (httpx.HTTPError, OSError, ValueError, SQLAlchemyError)
+            ):
+                raise ChatServiceError(
+                    "file_upload_failed", 502, "The file could not be stored; try again"
+                ) from error
+            raise
         return row
 
     def delete_file(
