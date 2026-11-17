@@ -45,12 +45,15 @@ Generated from `deploy/cron_schedules.py`; update this table when you change it.
 | `pwc-cron-sync-open-asr.timer` | `*-*-* *:15:00` | `sync_open_asr` | `.github/workflows/scripts/hourly/sync_open_asr.py` |
 | `pwc-cron-sync-open-tts.timer` | `*-*-* *:18:00` | `sync_open_tts` | `.github/workflows/scripts/hourly/sync_open_tts.py` |
 | `pwc-cron-sync-parsebench.timer` | `*-*-* *:20:00` | `sync_parsebench` | `.github/workflows/scripts/hourly/sync_parsebench.py` |
+| `pwc-cron-sync-parsebench-2.timer` | `*-*-* *:24:00` | `sync_parsebench_2` | `.github/workflows/scripts/hourly/sync_parsebench_2.py` |
 | `pwc-cron-sync-deepswe.timer` | `*-*-* *:25:00` | `sync_deepswe` | `.github/workflows/scripts/hourly/sync_deepswe.py` |
 | `pwc-cron-sync-extractbench.timer` | `*-*-* *:32:00` | `sync_extractbench` | `.github/workflows/scripts/hourly/sync_extractbench.py` |
 | `pwc-cron-sync-vals-finance-agent.timer` | `*-*-* *:47:00` | `sync_vals_finance_agent` | `.github/workflows/scripts/hourly/sync_vals_finance_agent.py` |
 | `pwc-cron-sync-surge-chartography.timer` | `*-*-* *:38:00` | `sync_surge_chartography` | `.github/workflows/scripts/hourly/sync_surge_chartography.py` |
 | `pwc-cron-sync-swe-marathon.timer` | `*-*-* *:26:00` | `sync_swe_marathon` | `.github/workflows/scripts/hourly/sync_swe_marathon.py` |
 | `pwc-cron-sync-jevbench.timer` | `*-*-* *:37:00` | `sync_jevbench` | `.github/workflows/scripts/hourly/sync_jevbench.py` |
+| `pwc-cron-sync-sle.timer` | `*-*-* *:41:00` | `sync_sle` | `.github/workflows/scripts/hourly/sync_sle.py` |
+| `pwc-cron-sync-rsi-exam.timer` | `*-*-* *:49:00` | `sync_rsi_exam` | `.github/workflows/scripts/hourly/sync_rsi_exam.py` |
 | `pwc-cron-sync-frontiercs-2.timer` | `*-*-* *:43:00` | `sync_frontiercs_2` | `.github/workflows/scripts/hourly/sync_frontiercs_2.py` |
 | `pwc-cron-sync-vals-index.timer` | `*-*-* *:03:00` | `sync_vals_index` | `.github/workflows/scripts/hourly/sync_vals_index.py` |
 | `pwc-cron-sync-swe-sweep.timer` | `*-*-* *:08:00` | `sync_swe_sweep` | `.github/workflows/scripts/hourly/sync_swe_sweep.py` |
@@ -437,6 +440,17 @@ official release page, stores the overall score plus the five dimension scores,
 owns only its managed-prefix rows, and logs unreviewed provider labels as a
 warning instead of failing.
 
+`sync_parsebench_2.py` applies the same contract to `leaderboard-v2.csv` in the
+same repository, keeping the `parsebench-2` benchmark on task `ocr`: Overall
+(ParseBench-2) plus the Text, Formatting, Tables, Charts, Visual Grounding and
+Forms scores. ParseBench-2 provider labels differ from v1 ("Claude Opus 5.5",
+"LightOnOCR-3 4B"), so the board has its own reviewed map, which also carries
+each open-weight row's Hub checkpoint (the v2 CSV has no `HF_Model_ID`
+column). Commercial parsers are reviewed exclusions; other `Vision Models` and
+`Open Weight` rows auto-match an indexed paper or become release-radar
+signals. A hand-imported row with the same paper and provider label is adopted
+rather than duplicated.
+
 `sync_extractbench.py` applies the same reviewed-label contract to the official
 `leaderboard.csv` in `run-llama/ExtractBench`. It stores unified value F1 plus
 word- and page-level grounding F1 on the Document Understanding task, and omits
@@ -532,6 +546,31 @@ method label leaves `v1.7`, as well as on broken ranks, a composite out of rank
 order, or a board outside 20–300 rows. General LLMs measured as decision
 models keep their best reasoning setting; vendor systems without a catalog
 paper become release-radar signals, with the vendor taken from the source host.
+
+`sync_sle.py` keeps six Science's Last Exam benchmarks on task
+`scientific-reasoning` equal to https://sciences-last-exam.org/leaderboard:
+the composite (`science-s-last-exam-sle`, Composite Score) and the Hypothesis
+Discovery (Inspire Rate), Protocol Planning (Mean score), Scientific Computing,
+Scientific Software Operation and Experiment Observation (Pass Rate)
+assessments. The page renders from a `window.SLE = {leaderboard: {...}}`
+object in its hashed `assets/data.<hash>.js` bundle, which the job finds on the
+page and decodes as plain data. Each row carries the model's agent harness
+(Codex, Claude Code), or DiscoveryRSI for Hypothesis Discovery. A score the
+site marks with a status ("in progress") is skipped, and so is that model's
+composite. The job fails when an assessment metric changes, the composite stops
+averaging exactly the six current assessments, or the board lists fewer than 3
+or more than 60 models. End-to-end research (0 for every model) has no board.
+
+`sync_rsi_exam.py` keeps the `rsi-exam` benchmark on task `auto-research`
+equal to the Full board on https://rsi-exam.ai/ (all 88 tasks): every model's
+mean frozen normalised hidden-set score, with the coding-agent harness it ran
+in (Claude Code, Codex, Antigravity, ...) and the reasoning effort in the
+methodology. The page renders the board as static SVG; the Public and Private
+panels are not used. Scores are only comparable within one release and task
+set, so the job fails when the page stops naming `RSI-Exam 0.1`, when the Full
+board covers other than 88 tasks, on an unreviewed harness label, broken
+ranks, a score out of rank order, or a board outside 10–100 rows. Models
+without a catalog paper become release-radar signals.
 
 `sync_physics_iq_verified.py` parses the Physics-IQ Verified table in the
 official `google-deepmind/physics-IQ-benchmark` README (the

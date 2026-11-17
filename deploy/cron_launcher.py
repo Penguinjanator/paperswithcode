@@ -399,6 +399,15 @@ COMMANDS: dict[str, Job] = {
             "replace managed ParseBench evaluation rows from the validated leaderboard.csv"
         ),
     ),
+    "sync_parsebench_2": job(
+        "-m",
+        "scripts.hourly.sync_parsebench_2",
+        timeout="30m",
+        idempotency=(
+            "replace managed ParseBench-2 evaluation rows from the validated "
+            "leaderboard-v2.csv"
+        ),
+    ),
     "sync_extractbench": job(
         "-m",
         "scripts.hourly.sync_extractbench",
@@ -441,6 +450,25 @@ COMMANDS: dict[str, Job] = {
         idempotency=(
             "create or revise reviewed JevBench evaluation rows from Benchmark "
             "Heaven's validated API board; never creates papers"
+        ),
+    ),
+    "sync_sle": job(
+        "-m",
+        "scripts.hourly.sync_sle",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed Science's Last Exam evaluation rows on "
+            "six boards from the validated sciences-last-exam.org leaderboard "
+            "bundle; never creates papers"
+        ),
+    ),
+    "sync_rsi_exam": job(
+        "-m",
+        "scripts.hourly.sync_rsi_exam",
+        timeout="30m",
+        idempotency=(
+            "create or revise reviewed RSI-Exam evaluation rows from the "
+            "validated rsi-exam.ai Full board; never creates papers"
         ),
     ),
     "sync_frontiercs_2": job(

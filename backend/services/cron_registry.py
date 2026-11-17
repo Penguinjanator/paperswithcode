@@ -94,6 +94,9 @@ class CronJobDefinition:
     critical: bool
     healthy_no_work_allowed: bool
     db_freshness_query: Optional[str] = None
+    # False when the query reports coverage only: its tables carry no write
+    # timestamp, so a missing `last_write` is not evidence of stale output.
+    db_freshness_reports_writes: bool = True
     workflow_file: Optional[str] = None
     workflow_jobs: Tuple[str, ...] = ()
     workflow_freshness_required: bool = True
@@ -248,9 +251,42 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         schedule_policies=(SchedulePolicy.fixed(60),),
         systemd_timer="pwc-cron-send-research-digests.timer",
         systemd_service="pwc-cron-send-research-digests.service",
-        output_evaluator="generic",
+        output_evaluator="research_digests",
         workflow_freshness_required=False,
         enablement_settings=("research_email_enabled",),
+        # Digests are written once a week (Monday 08:00 UTC window), so the
+        # hourly job's output is judged by window coverage, not write age.
+        # Aggregates only: never recipients or payloads.
+        db_freshness_query="""
+            WITH windows AS (
+              SELECT
+                date_trunc('week', (now() AT TIME ZONE 'UTC') - interval '8 hours')
+                  + interval '8 hours' AS current_utc
+            ),
+            bounds AS (
+              SELECT current_utc AT TIME ZONE 'UTC' AS current_window,
+                     (current_utc - interval '7 days') AT TIME ZONE 'UTC' AS previous_window
+              FROM windows
+            )
+            SELECT
+              floor(extract(epoch FROM now() - b.current_window) / 60)::bigint
+                AS current_window_age_minutes,
+              count(d.*) FILTER (WHERE d.window_end = b.current_window) AS current_window_digests,
+              count(d.*) FILTER (
+                WHERE d.window_end = b.current_window AND d.status = 'sent'
+              ) AS current_window_sent,
+              count(d.*) FILTER (WHERE d.window_end = b.previous_window) AS previous_window_digests,
+              count(d.*) FILTER (
+                WHERE d.status = 'uncertain' AND d.window_end >= b.previous_window
+              ) AS uncertain_digests,
+              count(d.*) FILTER (
+                WHERE d.status = 'pending' AND d.window_end < now() - interval '24 hours'
+              ) AS overdue_pending_digests
+            FROM bounds b
+            LEFT JOIN research_digests d ON d.window_end >= b.previous_window
+            GROUP BY b.current_window
+        """,
+        db_freshness_reports_writes=False,
     ),
     CronJobDefinition(
         id="paper_markdown_backfill",
@@ -994,6 +1030,22 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                           'Managed by the Papers with Code Artificial Analysis Decision Index live sync.%'
                     )
                   )
+            ),
+            -- The sync skips an index Artificial Analysis withdraws entirely
+            -- (Agentic since 2026-10-29), so it is expected only while it
+            -- still has managed rows.
+            expected_datasets AS (
+              SELECT slug
+              FROM (
+                VALUES
+                  ('artificial-analysis-intelligence-index'),
+                  ('artificial-analysis-provider-voice-tts-arena'),
+                  ('artificial-analysis-decision-index')
+              ) AS always_published(slug)
+              UNION
+              SELECT DISTINCT dataset_slug
+              FROM managed_evaluations
+              WHERE dataset_slug = 'artificial-analysis-agentic-index'
             )
             SELECT max(updated_at) AS last_write,
                    count(*) FILTER (
@@ -1004,8 +1056,15 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                      WHERE updated_at IS NULL
                         OR updated_at <= now() - interval '3 hours'
                    ) AS stale_evaluations,
-                   4 - count(DISTINCT dataset_slug) FILTER (
-                     WHERE updated_at > now() - interval '3 hours'
+                   (
+                     SELECT count(*)
+                     FROM expected_datasets expected
+                     WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM managed_evaluations fresh
+                       WHERE fresh.dataset_slug = expected.slug
+                         AND fresh.updated_at > now() - interval '3 hours'
+                     )
                    ) AS missing_fresh_datasets
             FROM managed_evaluations
         """,
@@ -1089,6 +1148,45 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                   'Managed by the Papers with Code ParseBench live sync.%'
         """,
         workflow_file="cron-sync-parsebench.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_parsebench_2",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(60, offset_minutes=24),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-parsebench-2.timer",
+        systemd_service="pwc-cron-sync-parsebench-2.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync ParseBench-2 Leaderboard",
+        category="hourly",
+        schedule="24 * * * * (hourly)",
+        script_path="hourly/sync_parsebench_2.py",
+        log_name="sync_parsebench_2",
+        process_patterns=("scripts.hourly.sync_parsebench_2",),
+        lock_file=(
+            "/var/lib/paperswithcode/production/cron-locks/sync_parsebench_2.lock"
+        ),
+        expected_runtime_minutes=5,
+        stale_after_minutes=150,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '2 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'parsebench-2'
+              AND e.best_metric = 'Overall (ParseBench-2)'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code ParseBench-2 live sync.%'
+        """,
+        workflow_file="cron-sync-parsebench-2.yml",
         workflow_jobs=("run",),
         dashboard_group="leaderboard_sync",
     ),
@@ -1317,6 +1415,85 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                   'Managed by the Papers with Code Benchmark Heaven JevBench live sync.%'
         """,
         workflow_file="cron-sync-jevbench.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_sle",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(60, offset_minutes=41),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-sle.timer",
+        systemd_service="pwc-cron-sync-sle.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync Science's Last Exam Leaderboards",
+        category="hourly",
+        schedule="41 * * * * (hourly)",
+        script_path="hourly/sync_sle.py",
+        log_name="sync_sle",
+        process_patterns=("scripts.hourly.sync_sle",),
+        lock_file=("/var/lib/paperswithcode/production/cron-locks/sync_sle.lock"),
+        expected_runtime_minutes=5,
+        stale_after_minutes=150,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '2 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug IN (
+                    'science-s-last-exam-sle',
+                    'sle-hypothesis-discovery',
+                    'sle-protocol-planning',
+                    'sle-scientific-computing',
+                    'sle-scientific-software-operation',
+                    'sle-experiment-observation'
+                  )
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code Science''s Last Exam live sync.%'
+        """,
+        workflow_file="cron-sync-sle.yml",
+        workflow_jobs=("run",),
+        dashboard_group="leaderboard_sync",
+    ),
+    CronJobDefinition(
+        id="sync_rsi_exam",
+        scheduler="systemd",
+        schedule_policies=(SchedulePolicy.fixed(60, offset_minutes=49),),
+        schedule_grace_minutes=20,
+        systemd_timer="pwc-cron-sync-rsi-exam.timer",
+        systemd_service="pwc-cron-sync-rsi-exam.service",
+        systemd_extra_units=(),
+        output_evaluator="generic",
+        display_name="Sync RSI-Exam Leaderboard",
+        category="hourly",
+        schedule="49 * * * * (hourly)",
+        script_path="hourly/sync_rsi_exam.py",
+        log_name="sync_rsi_exam",
+        process_patterns=("scripts.hourly.sync_rsi_exam",),
+        lock_file=("/var/lib/paperswithcode/production/cron-locks/sync_rsi_exam.lock"),
+        expected_runtime_minutes=5,
+        stale_after_minutes=150,
+        critical=False,
+        healthy_no_work_allowed=False,
+        db_freshness_query="""
+            SELECT max(e.updated_at) AS last_write,
+                   count(*) FILTER (
+                     WHERE e.updated_at > now() - interval '2 hours 30 minutes'
+                   ) AS recent_writes,
+                   count(*) AS matched_evaluations
+            FROM evaluations e
+            JOIN datasets d ON d.id = e.dataset_id
+            WHERE d.slug = 'rsi-exam'
+              AND e.methodology LIKE
+                  'Managed by the Papers with Code RSI-Exam live sync.%'
+        """,
+        workflow_file="cron-sync-rsi-exam.yml",
         workflow_jobs=("run",),
         dashboard_group="leaderboard_sync",
     ),
@@ -2613,6 +2790,8 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN papers p ON p.id = po.paper_id
             WHERE po.source = 'openalex'
         """,
+        # paper_organizations has no timestamp; the run log is the output proof.
+        db_freshness_reports_writes=False,
         workflow_file="cron-link-openalex-organizations.yml",
         workflow_jobs=("run",),
     ),

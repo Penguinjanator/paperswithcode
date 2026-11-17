@@ -238,6 +238,11 @@ TIMERS: tuple[TimerSpec, ...] = (
         description="Sync ParseBench leaderboard hourly",
     ),
     TimerSpec(
+        job="sync_parsebench_2",
+        on_calendar=("*-*-* *:24:00",),
+        description="Sync ParseBench-2 leaderboard hourly",
+    ),
+    TimerSpec(
         job="sync_deepswe",
         on_calendar=("*-*-* *:25:00",),
         description="Sync DeepSWE leaderboard hourly",
@@ -266,6 +271,16 @@ TIMERS: tuple[TimerSpec, ...] = (
         job="sync_jevbench",
         on_calendar=("*-*-* *:37:00",),
         description="Sync JevBench leaderboard from Benchmark Heaven hourly",
+    ),
+    TimerSpec(
+        job="sync_sle",
+        on_calendar=("*-*-* *:41:00",),
+        description="Sync Science's Last Exam leaderboards hourly",
+    ),
+    TimerSpec(
+        job="sync_rsi_exam",
+        on_calendar=("*-*-* *:49:00",),
+        description="Sync RSI-Exam leaderboard from rsi-exam.ai hourly",
     ),
     TimerSpec(
         job="sync_frontiercs_2",

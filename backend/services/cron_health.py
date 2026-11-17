@@ -141,9 +141,19 @@ def _patterns_are_running(
     for pid, _parent_pid, command in processes:
         if pid in diagnostic_ancestry or "python" not in command or "grep" in command:
             continue
-        if any(pattern in command for pattern in patterns):
+        if any(_names_process(pattern, command) for pattern in patterns):
             return True
     return False
+
+
+def _names_process(pattern: str, command: str) -> bool:
+    """Whether ``command`` contains ``pattern`` as a whole name.
+
+    ``scripts.hourly.sync_parsebench`` must not match the command of
+    ``scripts.hourly.sync_parsebench_2``, so the pattern may not run on into
+    further identifier characters.
+    """
+    return re.search(re.escape(pattern) + r"(?![A-Za-z0-9_])", command) is not None
 
 
 def is_process_running(patterns: tuple[str, ...]) -> bool:
@@ -1693,10 +1703,19 @@ def _hot_github_trending_contract(
             status = "degraded"
         reasons.append(f"rate-limit reserve stopped {reserve_stops} run(s)")
     if remaining is not None and reserve is not None and int(remaining) < int(reserve):
-        status = _worse_output(status, "broken")
-        reasons.append(
-            f"rate-limit reserve violated ({remaining} remaining < {reserve})"
-        )
+        if reserve_stops:
+            # The job stops at the reserve before each call, so a reading below
+            # it after a stop means another job sharing the token spent the
+            # budget: the reserve worked, the token is contended.
+            status = _worse_output(status, "degraded")
+            reasons.append(
+                f"shared GitHub budget below reserve ({remaining} remaining < {reserve})"
+            )
+        else:
+            status = _worse_output(status, "broken")
+            reasons.append(
+                f"rate-limit reserve violated ({remaining} remaining < {reserve})"
+            )
     return status, reasons
 
 
@@ -2068,6 +2087,51 @@ def _suggested_questions_contract(
     return status, reasons
 
 
+def _research_digests_contract(
+    status: str,
+    reasons: List[str],
+    context: OutputEvaluationContext,
+) -> tuple[str, List[str]]:
+    """Weekly digests: the current window exists and nothing is stuck."""
+    db = context.db
+    if "current_window_digests" not in db:
+        return status, reasons
+    current = int(db.get("current_window_digests") or 0)
+    previous = int(db.get("previous_window_digests") or 0)
+    age = int(db.get("current_window_age_minutes") or 0)
+    uncertain = int(db.get("uncertain_digests") or 0)
+    overdue = int(db.get("overdue_pending_digests") or 0)
+    problems: List[str] = []
+    # Give the 08:00 run two hours before calling a window missing, and only
+    # when last week had recipients (no followers means no digests at all).
+    if not current and previous and age > 120:
+        problems.append(
+            f"no digests for this week's window although last week had {previous}"
+        )
+    if uncertain:
+        problems.append(
+            f"{uncertain} digest(s) uncertain; reconcile with the provider "
+            "before any resend"
+        )
+    if overdue:
+        problems.append(f"{overdue} digest(s) still pending after the retry window")
+    if problems:
+        return _worse_output(status, "degraded"), reasons + problems
+    reasons = [reason for reason in reasons if reason != context.db_reason]
+    reasons = [
+        reason
+        for reason in reasons
+        if reason != "insufficient log and database evidence"
+    ]
+    if status in {"degraded", "unknown"} and not reasons:
+        status = "healthy"
+    reasons.append(
+        f"this week's window has {current} digest(s), "
+        f"{int(db.get('current_window_sent') or 0)} sent"
+    )
+    return status, reasons
+
+
 OutputEvaluator = Callable[
     [str, List[str], OutputEvaluationContext],
     tuple[str, List[str]],
@@ -2133,6 +2197,7 @@ OUTPUT_POLICIES = {
     "artificial_analysis": OutputPolicy(_artificial_analysis_contract),
     "enrichment_snapshot": OutputPolicy(_enrichment_snapshot_contract),
     "generic": OutputPolicy(lambda status, reasons, _context: (status, reasons)),
+    "research_digests": OutputPolicy(_research_digests_contract),
     "tabarena": OutputPolicy(_tabarena_contract),
     "conference_deadlines": OutputPolicy(_conference_deadlines_contract),
     "github_stars": OutputPolicy(_github_stars_contract),
@@ -2564,7 +2629,7 @@ def evaluate_job_health(
             db_reason = (
                 f"database freshness query failed: {db_metrics['freshness_error']}"
             )
-        else:
+        elif job.db_freshness_reports_writes:
             db_stale, db_reason = _db_is_stale(
                 db_metrics, job.stale_after_minutes, now=now
             )
@@ -2621,7 +2686,7 @@ def evaluate_job_health(
         status = "healthy"
         reasons.append("completed with no work (allowed for this job)")
     else:
-        if output_policy.refresh_db_freshness:
+        if output_policy.refresh_db_freshness and job.db_freshness_reports_writes:
             db_stale, db_reason = _db_is_stale(
                 db_metrics, job.stale_after_minutes, now=now
             )

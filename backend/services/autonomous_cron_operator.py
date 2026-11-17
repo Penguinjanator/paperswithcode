@@ -104,6 +104,7 @@ _OWNED_SERVICE_PATHS: Mapping[str, tuple[str, ...]] = {
     ),
     "sync_programbench": ("backend/services/programbench_sync_service.py",),
     "sync_parsebench": ("backend/services/parsebench_sync_service.py",),
+    "sync_parsebench_2": ("backend/services/parsebench_sync_service.py",),
     "sync_extractbench": ("backend/services/extractbench_sync_service.py",),
     "sync_physics_iq_verified": (
         "backend/services/physics_iq_verified_sync_service.py",
@@ -118,6 +119,15 @@ _OWNED_SERVICE_PATHS: Mapping[str, tuple[str, ...]] = {
     ),
     "sync_jevbench": (
         "backend/services/jevbench_sync_service.py",
+        "backend/services/carbon_board_syncs.py",
+        "backend/services/live_leaderboard_sync.py",
+    ),
+    "sync_sle": (
+        "backend/services/sle_sync_service.py",
+        "backend/services/live_leaderboard_sync.py",
+    ),
+    "sync_rsi_exam": (
+        "backend/services/rsi_exam_sync_service.py",
         "backend/services/carbon_board_syncs.py",
         "backend/services/live_leaderboard_sync.py",
     ),
@@ -265,6 +275,7 @@ _FOCUSED_TESTS: Mapping[str, tuple[str, ...]] = {
     ),
     "sync_programbench": ("backend/tests/evaluation/test_programbench_sync.py",),
     "sync_parsebench": ("backend/tests/evaluation/test_parsebench_sync.py",),
+    "sync_parsebench_2": ("backend/tests/evaluation/test_parsebench_sync.py",),
     "sync_extractbench": ("backend/tests/evaluation/test_extractbench_sync.py",),
     "sync_physics_iq_verified": (
         "backend/tests/evaluation/test_physics_iq_verified_sync.py",
@@ -278,6 +289,8 @@ _FOCUSED_TESTS: Mapping[str, tuple[str, ...]] = {
     "sync_frontiercs_2": ("backend/tests/evaluation/test_frontiercs_2_sync.py",),
     "sync_swe_marathon": ("backend/tests/evaluation/test_swe_marathon_sync.py",),
     "sync_jevbench": ("backend/tests/evaluation/test_jevbench_sync.py",),
+    "sync_sle": ("backend/tests/evaluation/test_sle_sync.py",),
+    "sync_rsi_exam": ("backend/tests/evaluation/test_rsi_exam_sync.py",),
     "sync_vals_index": ("backend/tests/evaluation/test_carbon_board_syncs.py",),
     "sync_swe_sweep": ("backend/tests/evaluation/test_carbon_board_syncs.py",),
     "sync_vending_bench_2": ("backend/tests/evaluation/test_carbon_board_syncs.py",),

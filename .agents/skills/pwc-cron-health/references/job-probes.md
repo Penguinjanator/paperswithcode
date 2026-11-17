@@ -109,6 +109,11 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Contract:** `parsebench` on task `ocr`; Overall (ParseBench) plus Tables, Charts, Content Faithfulness, Semantic Formatting, Visual Grounding; official `leaderboard.csv` in `run-llama/parsebench`; typically 40–400 upstream rows, of which only reviewed provider labels are published.
 - **Proof:** Diff the current CSV against managed rows (model label, six scores, `hf_model_url`); confirm `parsebench_unreviewed` warnings are either mapped or added to the reviewed exclusions; verify stale managed rows were deleted and ranks recomputed on Overall (ParseBench).
 
+## `sync_parsebench_2`
+
+- **Contract:** `parsebench-2` on task `ocr`; Overall (ParseBench-2) = mean of Text, Formatting, Tables, Charts, Visual Grounding, Forms (each suffixed ` (ParseBench-2)`); official `leaderboard-v2.csv` in `run-llama/parsebench`; typically 40–400 upstream rows (55 on 2026-11-16, 40 published, 14 commercial exclusions).
+- **Proof:** Diff the current CSV against managed rows (provider label, seven scores, `hf_model_url` from `PARSEBENCH_2_MODELS`); confirm `parsebench_2_unreviewed` warnings are either mapped, excluded, or radar signals; verify stale managed rows were deleted and ranks recomputed on Overall (ParseBench-2).
+
 ## `sync_extractbench`
 
 - **Contract:** `extractbench` on task `document-understanding`; Value F1 plus Word Grounding F1 and Page Grounding F1 (omitted when upstream reports 0.00 for both); official `leaderboard.csv` in `run-llama/ExtractBench`; typically 30–400 upstream rows, of which only reviewed provider labels are published.
@@ -129,10 +134,20 @@ For every managed leaderboard sync, fetch the current upstream source read-only 
 - **Contract:** `swe-marathon` on task `long-horizon-agents`; Resolution Rate (%) 0–100 = trials with reward 1 / all trials of a complete v1.1 run (20 tasks x 8 trials), best reasoning effort per model and agent, from the `{version:`v1.1`,tasks:JSON.parse(...)}` block in the `/assets/index-*.js` bundle that https://www.swe-marathon.org/ loads; typically 10–300 complete runs (29 on 2026-11-10).
 - **Proof:** Recompute a few rows from the bundle (the tweet/site rounds to one decimal: 53.75 shows as 53.8); confirm `sync_swe_marathon_unreviewed` names become radar signals or get an identity in `swe_marathon_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated; a failure naming result versions means Abundant published a new benchmark version, which needs a reviewer decision (new benchmark row), not a parser patch.
 
+## `sync_rsi_exam`
+
+- **Contract:** `rsi-exam` on task `auto-research`; Normalized Score (0–1, four decimals) of every row on the Full board (release RSI-Exam 0.1, 88 tasks) at https://rsi-exam.ai/, harness per row (Claude Code, Codex, Antigravity, Grok, Kimi Code, Qwen Code, Muse Code); typically 10–100 rows (21 on 2026-11-16, 20 on catalog papers).
+- **Proof:** Compare managed rows' order and values with the Full tab; confirm `sync_rsi_exam_unreviewed` names become radar signals or get an identity in `rsi_exam_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated; a failure naming the release or task count means RSI-Exam rescaled the board, which needs a reviewer decision before bumping `RELEASE`/`FULL_TASKS`, not a parser patch. An unreviewed harness label needs a `HARNESSES` entry.
+
 ## `sync_jevbench`
 
 - **Contract:** `jevbench` on task `decision-making`; Composite Score 0–100 (two decimals) of every ranked row on Benchmark Heaven's official API board (`api_board_rank` set, method v1.7), from https://benchmarkheaven.com/api/jevbench/latest; ranks match https://benchmarkheaven.com/jev-models/api; typically 20–300 ranked API rows (48 on 2026-11-12, 6 on catalog papers).
 - **Proof:** Compare managed rows' relative order and values with the API board; confirm `sync_jevbench_unreviewed` names become radar signals (vendor from the source host) or get an identity in `jevbench_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated; a failure naming the method means Benchmark Heaven restated scores on a new method, which needs a reviewer decision before bumping `METHOD`, not a parser patch.
+
+## `sync_sle`
+
+- **Contract:** six benchmarks on task `scientific-reasoning`: `science-s-last-exam-sle` (Composite Score), `sle-hypothesis-discovery` (Inspire Rate, harness DiscoveryRSI), `sle-protocol-planning` (Mean score), `sle-scientific-computing`, `sle-scientific-software-operation` and `sle-experiment-observation` (Pass Rate), all 0–100 to two decimals, from the `leaderboard` object in the `assets/data.<hash>.js` bundle that https://sciences-last-exam.org/leaderboard loads; rows carry the model's harness (Codex, Claude Code); scores with a `status` and the composites of those models are skipped; typically 3–60 models (9 on 2026-11-16, all reviewed).
+- **Proof:** Compare a few managed rows with the site's leaderboard tabs; confirm `sync_sle_unreviewed` names become radar signals or get an identity in `sle_sync_service.py`, `missing_papers` is empty, and `missing_upstream` rows were investigated (a model whose assessment turned provisional drops off that board); a failure naming the composite members or an assessment metric means SLE redefined a score, which needs a reviewer decision, not a parser patch.
 
 ## `sync_frontiercs_2`
 
