@@ -26,9 +26,11 @@ from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.config import Settings
+from backend.database.paper_merge import merge_external_release_duplicate
 from backend.models.database import (
     BenchmarkCurationCandidate,
     BenchmarkCurationEvidence,
@@ -405,12 +407,17 @@ def _release_git_revision(root: Path) -> str | None:
     return revision if isinstance(revision, str) and len(revision) == 40 else None
 
 
-def _runner_fields(settings: Settings, runner: str) -> dict[str, str]:
+def _runner_fields(settings: Settings, runner: str, kind: str) -> dict[str, str]:
     """Model, effort, and harness version recorded on a job of each runner."""
     if runner == "pi":
+        thinking = (
+            settings.curation_pi_enrich_thinking
+            if kind == "enrich-paper"
+            else settings.curation_pi_thinking
+        )
         return {
             "model": settings.curation_pi_model,
-            "reasoning_effort": settings.curation_pi_thinking,
+            "reasoning_effort": thinking,
             "codex_cli_version": f"pi@{settings.curation_pi_cli_version}",
         }
     return {
@@ -1299,7 +1306,7 @@ class CodexPaperJobService:
                 runner="pi",
                 paired_job_id=codex_row.id,
                 context_snapshot=jsonable_encoder(context),
-                **_runner_fields(settings, "pi"),
+                **_runner_fields(settings, "pi", codex_row.kind),
             )
             db.add(row)
             db.commit()
@@ -1366,7 +1373,7 @@ class CodexPaperJobService:
         row.skill_sha256 = _curator_skill_digest(row.kind)
         row.bootstrap_bundle_sha256 = _store_bootstrap_bundle(db, revision)
         for field, value in _runner_fields(
-            settings, getattr(row, "runner", "codex")
+            settings, getattr(row, "runner", "codex"), row.kind
         ).items():
             setattr(row, field, value)
         row.validator_version = "scheduled-policy-v1"
@@ -1431,7 +1438,7 @@ class CodexPaperJobService:
         image: str,
     ):
         runner = getattr(row, "runner", "codex")
-        defaults = _runner_fields(settings, runner)
+        defaults = _runner_fields(settings, runner, row.kind)
         command = PI_CURATOR_COMMAND if runner == "pi" else CURATOR_COMMAND
         env = {
             "PWC_CURATION_API_URL": settings.codex_jobs_api_url.rstrip("/"),
@@ -2091,6 +2098,24 @@ class CodexPaperJobService:
             state.pause_reason = reason
             logger.error("paper curation dispatch paused condition=%s", condition)
 
+    @staticmethod
+    def _merge_external_release(db: Session, paper_id: int | None) -> None:
+        """Move an earlier launch page's evals onto its ArXiv report first.
+
+        Otherwise add-evals sees the report's scores as duplicates of the
+        launch page and leaves the ArXiv paper without results.
+        """
+        if paper_id is None:
+            return
+        try:
+            stats = merge_external_release_duplicate(db, paper_id)
+        except SQLAlchemyError:
+            # The merge ran in a savepoint; evaluation must still proceed.
+            logger.exception("external release merge failed for paper %s", paper_id)
+            return
+        if stats is not None:
+            logger.info("merged external release into paper %s: %s", paper_id, stats)
+
     def _advance_workflow(
         self, db: Session, row: PaperCurationJob, settings: Settings
     ) -> None:
@@ -2133,6 +2158,7 @@ class CodexPaperJobService:
                 .first()
             )
             if exists is None and workflow.evals_satisfied_by_job_id is None:
+                self._merge_external_release(db, row.paper_id)
                 self.enqueue(
                     db,
                     kind="add-evals",
@@ -2153,6 +2179,9 @@ class CodexPaperJobService:
                 workflow.status = "completed"
                 workflow.finished_at = _now()
         elif row.status == "completed" and row.kind == "add-evals":
+            # Retry a merge skipped while the launch page was being dispatched;
+            # the scores add-evals skipped as duplicates then move over.
+            self._merge_external_release(db, row.paper_id)
             workflow.status = "completed"
             workflow.finished_at = _now()
             # External-paper workflows are not part of any scheduled canary.
