@@ -1,6 +1,5 @@
 /* Shared foundations only: design tokens, document reset, application shell, cross-feature layout, navigation, typography, controls, and feedback primitives */
 /* Papers With Code — clean academic aesthetic */
-@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
   --bg: #FAF8F4;
@@ -33,9 +32,9 @@
 
   --app-leading-column-width: 280px;
 
-  --serif: 'Newsreader', Georgia, serif;
-  --sans: 'Inter', -apple-system, sans-serif;
-  --mono: 'JetBrains Mono', ui-monospace, monospace;
+  --serif: 'Newsreader', 'Newsreader Fallback', Georgia, serif;
+  --sans: 'Inter', 'Inter Fallback', -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', 'JetBrains Mono Fallback', ui-monospace, monospace;
 
   color-scheme: light;
 }
@@ -74,12 +73,15 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* 87.5% = 14px at the default 16px, but follows the user's browser/OS text
+   size. Only the root sets it: body inherits, and rem units resolve against it. */
+html { font-size: 87.5%; }
+
 html,
 body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;

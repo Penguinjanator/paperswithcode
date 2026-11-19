@@ -128,7 +128,10 @@ def _spa_document() -> HTMLResponse:
     shell = load_index_html()
     if shell is None:
         return HTMLResponse("Frontend bundle is not available.", status_code=500)
-    headers = {"Cache-Control": "no-store"}
+    # The shell is the same static document for every visitor. no-cache still
+    # revalidates on each load, so a deploy is picked up at once, but unlike
+    # no-store it lets the browser restore the page from its back/forward cache.
+    headers = {"Cache-Control": "no-cache"}
     if get_settings().environment.lower() == "staging":
         headers["X-Robots-Tag"] = "noindex, nofollow"
     return HTMLResponse(shell, headers=headers)
@@ -160,7 +163,7 @@ def _render(page: DiscoveryPage | None, request: Request) -> Response:
             headers={"Cache-Control": "no-store"},
         )
     try:
-        content = render_discovery_shell(shell, page)
+        content = render_discovery_shell(shell, page, request.url.path)
     except ValueError:
         return HTMLResponse(
             "<!doctype html><title>Papers with Code</title>"

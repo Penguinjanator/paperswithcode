@@ -16,7 +16,6 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.config import get_settings
@@ -28,6 +27,7 @@ from backend.services.deployment_lifecycle import (
 )
 from backend.routers.catalog_error_handlers import register_catalog_error_handlers
 from backend.services.runtime_validation import validate_runtime
+from backend.utils.cors import install_cors
 from backend.utils.csrf import cookie_request_passes_csrf
 
 # Requests slower than this (in milliseconds) are logged so production slow
@@ -418,19 +418,7 @@ def create_app() -> FastAPI:
     register_catalog_error_handlers(app)
     app.add_middleware(DeploymentAccountingMiddleware)
 
-    # Add CORS middleware. `allow_origin_regex` is used to permit the Hugging
-    # Face Space mirror (e.g. `https://<owner>-<name>.hf.space`) when the
-    # `PWC_EXTRA_ALLOWED_ORIGIN_REGEX` setting is configured, without having
-    # to hardcode every Space subdomain.
-    cors_kwargs = dict(
-        allow_origins=settings.cors_allowed_origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE"],
-        allow_headers=["*"],
-    )
-    if settings.extra_allowed_origin_regex:
-        cors_kwargs["allow_origin_regex"] = settings.extra_allowed_origin_regex
-    app.add_middleware(CORSMiddleware, **cors_kwargs)
+    install_cors(app, settings)
 
     @app.middleware("http")
     async def enforce_cookie_same_origin(request, call_next):
@@ -542,6 +530,7 @@ def create_app() -> FastAPI:
         conferences,
         contributions,
         cron,
+        csp_reports,
         datasets,
         dictation,
         evaluations,
@@ -573,6 +562,7 @@ def create_app() -> FastAPI:
     app.include_router(agent_discovery.router, tags=["agent_discovery"])
     app.include_router(autonomous_operations.router, prefix="/api/v1", tags=["admin"])
     app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
+    app.include_router(csp_reports.router, prefix="/api/v1", tags=["security"])
     app.include_router(staging_access.router, prefix="/api/v1", tags=["staging-access"])
     app.include_router(bookmarks.router, prefix="/api/v1", tags=["bookmarks"])
     app.include_router(contributions.router, prefix="/api/v1", tags=["contributions"])
@@ -731,7 +721,6 @@ def create_app() -> FastAPI:
     app.add_middleware(
         public_api.PublicReadCorsMiddleware,
         allowed_origins=settings.cors_allowed_origins,
-        allow_origin_regex=settings.extra_allowed_origin_regex or None,
     )
 
     return app
