@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -18,7 +19,10 @@ from websockets.exceptions import WebSocketException
 
 from backend.config import Settings
 from backend.database.connection import db_manager
-from backend.services.chat_capability_service import IssuedCapability
+from backend.services.chat_capability_service import (
+    ChatCapabilityService,
+    IssuedCapability,
+)
 from backend.services.chat_external_worker_registry import (
     ChatExternalWorkerRepository,
     ExternalWorkerClaim,
@@ -74,6 +78,16 @@ def _worker_websocket_url(base_url: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class ExternalProviderFallback:
+    """A second route the worker may replay a turn on before any output."""
+
+    route: str
+    model: str
+    protocol: str
+    capability: IssuedCapability
+
+
 class ExternalPiChatTurnRunner:
     """Run Pi on the trusted host and create a Modal executor only on tool use."""
 
@@ -105,6 +119,7 @@ class ExternalPiChatTurnRunner:
         observe: LifecycleObserver | None = None,
         cancel_timeout_seconds: float = 5.0,
         channel_factory: ChannelFactory | None = None,
+        provider_fallback: ExternalProviderFallback | None = None,
     ) -> None:
         require_ordinary_research_mode(
             poster_mode=admission.poster_mode,
@@ -117,6 +132,13 @@ class ExternalPiChatTurnRunner:
         self.resume_id = resume_id
         self.capability = capability
         self.capability_id: uuid.UUID | None = capability.capability_id
+        self.provider_fallback = provider_fallback
+        self.provider_fallback_route = (
+            provider_fallback.route if provider_fallback else None
+        )
+        self.provider_fallback_capability_id: uuid.UUID | None = (
+            provider_fallback.capability.capability_id if provider_fallback else None
+        )
         self.hf_username = hf_username
         self.provider = provider or ModalSandboxProviderAdapter(settings)
         self.executor = executor or SandboxExecutorClient(self.provider)
@@ -174,8 +196,6 @@ class ExternalPiChatTurnRunner:
         try:
             async for event in self._events(boundary):
                 if event.get("type") == "done":
-                    # Completion lets the stream consumer cancel the producer.
-                    # Release the retained workspace before that boundary.
                     await self.tool_executor.settle_turn()
                 yield event
             primary_exception_active = False
@@ -214,9 +234,6 @@ class ExternalPiChatTurnRunner:
                     terminal_sequence is not None
                     and durable_sequence >= last_checkpoint_sequence
                 ):
-                    # The producer may finish before its queued terminal commits.
-                    # The fenced terminal-control channel releases that retained
-                    # run without keeping the producer alive during persistence.
                     async with asyncio.timeout(2):
                         async with self._external_worker_socket(
                             worker_claim
@@ -235,8 +252,6 @@ class ExternalPiChatTurnRunner:
                     }
                     await socket.send(json.dumps(frame, separators=(",", ":")))
             except (OSError, TimeoutError, WebSocketException):
-                # Lost receipts retain replay frames. Later cumulative receipts
-                # retry progress; terminal grace bounds failed terminal cleanup.
                 pass
 
         seen_sequence = 0
@@ -328,9 +343,6 @@ class ExternalPiChatTurnRunner:
                             continue
                         if event.get("type") == "worker_done":
                             terminal_sequence = sequence
-                            # Old workers retain their existing protocol. New
-                            # workers may release only a durably consumed prefix;
-                            # otherwise their bounded terminal grace owns cleanup.
                             if (
                                 supports_durable_ack
                                 and durable_sequence < last_checkpoint_sequence
@@ -345,12 +357,6 @@ class ExternalPiChatTurnRunner:
                             terminal_acknowledged = True
                             return
                         if event.get("type") == "worker_ready":
-                            # Readiness proves that the trusted harness accepted
-                            # the run, but it is not part of the browser SSE
-                            # contract.
-                            # Live streams have no durable event journal. Keep
-                            # their existing terminal acknowledgement behavior;
-                            # only journal-backed consumers can prune progress.
                             supports_durable_ack = (
                                 event.get("durable_event_ack") is True
                                 and self.settings.chat_durable_turn_dispatch_enabled
@@ -629,7 +635,6 @@ class ExternalPiChatTurnRunner:
             "reader_mode": self.admission.reader_mode,
             "poster_mode": self.admission.poster_mode,
             "paper_artifacts_enabled": self.admission.paper_artifacts_enabled,
-            # read_user_file only exists where the gateway can resolve files.
             "user_files_enabled": (
                 self.settings.chat_file_uploads_enabled
                 and self.admission.model_route == self.settings.chat_openai_luna_route
@@ -645,6 +650,12 @@ class ExternalPiChatTurnRunner:
             frame["paper_descriptor"] = self.admission.paper_descriptor
         if prebound_agent_session_id is not None:
             frame["agent_session_id"] = str(prebound_agent_session_id)
+        if self.provider_fallback is not None:
+            frame["provider_fallback"] = {
+                "model": self.provider_fallback.model,
+                "provider_protocol": self.provider_fallback.protocol,
+                "capability": self.provider_fallback.capability.token,
+            }
         return frame
 
     @staticmethod
@@ -709,6 +720,11 @@ class ExternalPiChatTurnRunner:
         self.lifecycle.capability_id = self.capability_id
         self.lifecycle.revoke()
         self.capability_id = self.lifecycle.capability_id
+        if self.provider_fallback_capability_id is not None:
+            with self.session_factory() as db:
+                ChatCapabilityService(db).revoke(self.provider_fallback_capability_id)
+                db.commit()
+            self.provider_fallback_capability_id = None
 
     async def cancel(self) -> CancelControlResult:
         cancel_frame = {

@@ -7,14 +7,21 @@ from collections.abc import AsyncIterator
 from threading import Lock
 from typing import Protocol
 
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session
+
 from backend.config import Settings
 from backend.database.connection import db_manager
+from backend.models.database.chat_files import ChatUploadedFile
 from backend.services.chat_agent_service import stream_agent_events
 from backend.services.chat_capability_service import (
     ChatCapabilityService,
     IssuedCapability,
 )
-from backend.services.chat_external_pi_turn_runner import ExternalPiChatTurnRunner
+from backend.services.chat_external_pi_turn_runner import (
+    ExternalPiChatTurnRunner,
+    ExternalProviderFallback,
+)
 from backend.services.chat_latency_service import ChatLatencyService
 from backend.services.chat_durable_lifecycle_observer import (
     durable_lifecycle_observer,
@@ -188,6 +195,23 @@ def _provider_mode_for_route(
     return "huggingface"
 
 
+def _offers_provider_failover(
+    db: Session, settings: Settings, admission: TurnAdmission
+) -> bool:
+    """Direct OpenAI turns may replay once on the sponsored route.
+
+    Uploaded files exist only as OpenAI file_ids, so sessions that have any
+    stay on the primary route.
+    """
+    return (
+        settings.chat_provider_failover_enabled
+        and admission.model_route == settings.chat_openai_luna_route
+        and not db.scalar(
+            select(exists().where(ChatUploadedFile.session_id == admission.session_id))
+        )
+    )
+
+
 def shared_sandbox_manager(settings: Settings) -> SandboxSessionManager:
     """Keep persistent control attachments alive across HTTP turn runners."""
 
@@ -230,8 +254,6 @@ def create_chat_turn_runner(
     with db_manager.session_local() as db:
         provider = settings.chat_route_providers[admission.model_route]
         provider_mode = _provider_mode_for_route(settings, owner, admission.model_route)
-        # Sponsored routes bill the organization at the gateway, so the user's
-        # Hugging Face credential never enters the capability.
         user_billed_huggingface = (
             provider == "huggingface"
             and settings.chat_route_funding_modes.get(admission.model_route)
@@ -256,8 +278,6 @@ def create_chat_turn_runner(
             admission,
             qualification_authorized=qualification_authorized,
         )
-        # WebFetch is intentionally dormant for both harnesses during the
-        # controlled Pi comparison. The trusted gateway route remains intact.
         scopes = {"model", "catalog", "session_store"}
         if admission.web_search_enabled:
             scopes.add("web_search")
@@ -269,10 +289,15 @@ def create_chat_turn_runner(
             scopes.add("paper")
         if uses_external_pi:
             scopes.add("external_turn")
-            # Admission recorded the Modal sandbox shape because routing is only
-            # resolved here. Correct it before the turn is billed for compute it
-            # never uses.
             ChatLatencyService(db).mark_external_pi(request_id)
+        lifetime_seconds = round(
+            (
+                settings.chat_posterly_timeout_seconds
+                if admission.poster_mode
+                else settings.chat_agent_timeout_seconds
+            )
+            + 60
+        )
         capability = ChatCapabilityService(db).issue(
             chat_session_id=admission.session_id,
             turn_id=admission.turn_id,
@@ -297,15 +322,29 @@ def create_chat_turn_runner(
             scopes=scopes,
             sdk_session_id=resume_id,
             agent_harness=admission.agent_harness,
-            lifetime_seconds=round(
-                (
-                    settings.chat_posterly_timeout_seconds
-                    if admission.poster_mode
-                    else settings.chat_agent_timeout_seconds
-                )
-                + 60
-            ),
+            lifetime_seconds=lifetime_seconds,
         )
+        provider_fallback = None
+        if uses_external_pi and _offers_provider_failover(db, settings, admission):
+            route = settings.chat_sponsored_deepseek_route
+            provider_fallback = ExternalProviderFallback(
+                route=route,
+                model=settings.chat_route_provider_models[route],
+                protocol=settings.chat_route_protocols[route],
+                capability=ChatCapabilityService(db).issue(
+                    chat_session_id=admission.session_id,
+                    turn_id=admission.turn_id,
+                    owner_id=owner.hf_user_id,
+                    settings=settings,
+                    provider_mode="huggingface",
+                    reasoning_effort=admission.reasoning_effort,
+                    model=route,
+                    scopes={"model", "external_turn"},
+                    sdk_session_id=resume_id,
+                    agent_harness=admission.agent_harness,
+                    lifetime_seconds=lifetime_seconds,
+                ),
+            )
         db.commit()
     runner_type = ExternalPiChatTurnRunner if uses_external_pi else ModalChatTurnRunner
     runner_kwargs = dict(
@@ -319,4 +358,5 @@ def create_chat_turn_runner(
     )
     if runner_type is ExternalPiChatTurnRunner:
         runner_kwargs["observe"] = durable_lifecycle_observer(settings)
+        runner_kwargs["provider_fallback"] = provider_fallback
     return runner_type(**runner_kwargs)

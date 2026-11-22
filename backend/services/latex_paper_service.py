@@ -54,9 +54,6 @@ from latex_compiler_contract import CompilerJobState, CompilerResult, EnvelopeEr
 _PAPER_IDENTIFIER = "latex-paper"
 _PREVIEW_PDF = "preview.pdf"
 _MAX_REPAIR_ATTEMPTS = 3
-# Every compile starts a fresh paid provider sandbox, so each owner has an
-# aggregate budget on top of the per-job limits. Repair candidates are already
-# capped per failed version, which these version counts bound in turn.
 _MAX_ACTIVE_COMPILES_PER_OWNER = 2
 _MAX_COMPILES_PER_OWNER_PER_DAY = 100
 _REPAIR_POLL_ATTEMPTS = 20
@@ -72,6 +69,16 @@ _FIGURE_TYPES = {
     ".pdf": ("application/pdf", b"%PDF-"),
 }
 _SAFE_FIGURE_PATH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,299}")
+
+
+def _log_storage_cleanup_failure(stage: str, prefix: str, error: Exception) -> None:
+    logger.warning(
+        "latex_compiler_event event=storage_cleanup_failed "
+        "stage=%s storage_prefix=%s failure_class=%s",
+        stage,
+        prefix,
+        type(error).__name__,
+    )
 
 
 @dataclass(frozen=True)
@@ -522,8 +529,6 @@ class LatexPaperService:
                 "artifact_storage_failed", "Paper source storage failed"
             ) from error
         version.storage_state = "ready"
-        # Advance source before compilation so a failed compile remains a durable,
-        # repairable human version while the previous PDF remains the preview head.
         artifact.source_head_version_id = version.id
         self._compile(version, bundle, manifest.root_document)
         self.db.flush()
@@ -943,9 +948,6 @@ class LatexPaperService:
                 time.sleep(_REPAIR_POLL_SECONDS)
                 status = compiler.status(str(candidate_id))
             else:
-                # Repairs are intentionally ephemeral until a candidate finishes.
-                # A pending per-job Sandbox must be released rather than stranded
-                # without a durable version/job record to reconcile later.
                 compiler.cancel(str(candidate_id))
         except (httpx.HTTPError, EnvelopeError, RuntimeError, ValueError):
             if submitted:
@@ -1050,9 +1052,6 @@ class LatexPaperService:
                 "artifact_storage_failed", "Paper repair storage failed"
             ) from error
         if version.compile_status != "succeeded":
-            # A repair candidate is intentionally never a durable failed source.
-            # This includes a successful compiler result whose preview cannot be
-            # admitted into the owner's quota.
             candidate_diagnostics = version.compile_diagnostics or {}
             candidate_errors = candidate_diagnostics.get("errors")
             if not isinstance(candidate_errors, list):
@@ -1352,8 +1351,6 @@ class LatexPaperService:
                         entrypoint=manifest.root_document,
                     )
                 except RuntimeError:
-                    # The dedicated VM ended. A replacement remains safe because
-                    # the immutable source-version UUID is the logical key.
                     status = compiler.submit(
                         job_id=job_id, bundle=bundle, entrypoint=manifest.root_document
                     )
@@ -1381,10 +1378,13 @@ class LatexPaperService:
                 }
             else:
                 self._store_compile_result(version, compiler.result(job_id))
-        except (httpx.HTTPError, EnvelopeError, RuntimeError, ValueError):
-            # A transient poll failure is not a compile failure. Keep the durable
-            # source/job state for the next owner poll or later reconciliation.
-            pass
+        except (httpx.HTTPError, EnvelopeError, RuntimeError, ValueError) as error:
+            logger.warning(
+                "latex_compiler_event event=refresh_poll_failed "
+                "version_id=%s failure_class=%s",
+                version.id,
+                type(error).__name__,
+            )
         self.db.flush()
         return _paper_descriptor(artifact).model_copy(
             update={"editing_enabled": self._editing_enabled()}
@@ -1547,9 +1547,6 @@ class LatexPaperService:
         self, version: ChatLatexPaperVersion, bundle: bytes, entrypoint: str
     ) -> None:
         compiler = self.compiler or compiler_transport_from_settings(self.settings)
-        # The immutable source-version ID is the durable idempotency key. A
-        # fresh backend process can submit the same bundle after a Space restart
-        # without creating a second logical compile job.
         job_id = str(version.id)
         submitted_provider_job_id: str | None = None
         try:
@@ -1567,8 +1564,6 @@ class LatexPaperService:
                         entrypoint=entrypoint,
                     )
                 except RuntimeError:
-                    # A completed/lost VM is safe to replace: the immutable
-                    # version UUID remains the logical idempotency key.
                     status = compiler.submit(
                         job_id=job_id, bundle=bundle, entrypoint=entrypoint
                     )
@@ -1611,9 +1606,6 @@ class LatexPaperService:
                 return
             result = compiler.result(job_id)
         except httpx.HTTPError:
-            # The durable version remains eligible for the bounded operator
-            # reconciliation instead of being falsely finalized on a network
-            # failure or a compiler restart.
             version.compile_status = "queued"
             version.compile_diagnostics = {
                 "job_id": job_id,
@@ -1660,10 +1652,6 @@ class LatexPaperService:
         ).all()
         reconciled = 0
         for version_id, artifact_id in pending_versions:
-            # Acquire the same per-artifact transaction lock used by owner
-            # polls and writes before looking at a candidate again. The initial
-            # query is deliberately only a bounded work list: another worker
-            # may settle, delete, or attach this job before this lock is held.
             if self._lock_reconcile_artifact(artifact_id) is None:
                 continue
             version = self.db.scalar(
@@ -1743,7 +1731,10 @@ class LatexPaperService:
         for cleanup in pending:
             try:
                 self.storage.delete_prefix(cleanup.storage_prefix)
-            except Exception:
+            except Exception as error:
+                _log_storage_cleanup_failure(
+                    "reconcile_delete", cleanup.storage_prefix, error
+                )
                 continue
             self.db.delete(cleanup)
             reclaimed += 1
@@ -1882,8 +1873,6 @@ class LatexPaperService:
     def delete_project(self, owner_id: str, artifact_id: uuid.UUID) -> None:
         """Storage lifecycle hook for the later chat deletion policy."""
         artifact = self._artifact(owner_id, artifact_id, lock=True)
-        # The identity map can still retain an already-deleted historical row;
-        # query the durable set so cleanup only follows live references.
         versions = list(
             self.db.scalars(
                 select(ChatLatexPaperVersion).where(
@@ -1948,8 +1937,6 @@ class LatexPaperService:
             try:
                 cancel_provider_job(provider_job_id)
             except (EnvelopeError, httpx.HTTPError, OSError, RuntimeError, ValueError):
-                # Deleting the durable paper must not strand its chat merely
-                # because the already-disposable provider VM cannot be reached.
                 logger.warning(
                     "latex_compiler_event "
                     "event=delete_pending_sandbox_cancellation_failed"
@@ -1998,7 +1985,8 @@ class LatexPaperService:
             for stored_prefix in prefixes:
                 try:
                     self.storage.delete_prefix(stored_prefix)
-                except Exception:
+                except Exception as error:
+                    _log_storage_cleanup_failure("storage_delete", stored_prefix, error)
                     continue
                 try:
                     with Session(bind=session.bind) as cleanup_db:
@@ -2009,10 +1997,8 @@ class LatexPaperService:
                             )
                         )
                         cleanup_db.commit()
-                except Exception:
-                    # The object is already gone. Keep the durable queue item
-                    # so the bounded reconciler can retry the DB acknowledgement.
-                    continue
+                except Exception as error:
+                    _log_storage_cleanup_failure("queue_ack", stored_prefix, error)
 
         def discard_after_rollback(session: Session) -> None:
             session.info.pop("latex_paper_cleanup_prefixes", None)

@@ -7,6 +7,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from backend.chat_configuration.capacity_tiers import (
+    CHAT_CAPACITY_TIER_OPENAI_RATE_LIMIT_CALLS,
+    CHAT_CAPACITY_TIERS,
+)
 from backend.config import Settings
 from backend.chat_sandbox_worker.executor_protocol import PROTOCOL as EXECUTOR_CONTRACT
 from backend.services.chat_runtime_contract import (
@@ -26,9 +30,6 @@ class SandboxCapacityPolicy:
     blank_pool_max: int
 
 
-# Reviewed external Pi capacity tiers, keyed by admitted concurrent turns. The
-# deploy tooling sizes the eight-replica fleet from the same tier value, and
-# the OpenAI circuits below must match the tier (see docs/deployment.md).
 _EXTERNAL_PI_CAPACITY_POLICIES = {
     tier: SandboxCapacityPolicy(
         max_concurrency=tier,
@@ -37,22 +38,14 @@ _EXTERNAL_PI_CAPACITY_POLICIES = {
         blank_pool_min=1,
         blank_pool_max=1,
     )
-    for tier in (32, 64)
+    for tier in CHAT_CAPACITY_TIERS
 }
 
 
 _EXTERNAL_PI_CAPACITY_POLICY = _EXTERNAL_PI_CAPACITY_POLICIES[32]
 
 
-# OpenAI concurrency equals the tier; the ten-minute call allowance grows faster
-# because an MCP research turn spends 10-13 model calls and a full tier of turns
-# cycles several times per window. The 32-turn allowance keeps each
-# environment's established value; deploy/configure_host_env.py writes the same
-# table and a test pins the two together.
-_EXTERNAL_PI_OPENAI_RATE_LIMIT_CALLS = {
-    "production": {32: 512, 64: 4096},
-    "staging": {32: 300, 64: 4096},
-}
+_EXTERNAL_PI_OPENAI_RATE_LIMIT_CALLS = CHAT_CAPACITY_TIER_OPENAI_RATE_LIMIT_CALLS
 
 
 def _external_pi_capacity_tier(settings: Settings) -> int | None:

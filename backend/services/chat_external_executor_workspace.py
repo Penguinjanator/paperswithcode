@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import secrets
 import time
 import uuid
@@ -54,6 +55,8 @@ QualificationCapacityResolver = Callable[..., int | None]
 EXECUTOR_IDLE_RETENTION_SECONDS = 5 * 60
 EXECUTOR_RETAINED_GLOBAL_CAP = 10
 MIN_EXECUTOR_CLAIM_SECONDS = 240
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -186,8 +189,6 @@ class ChatExternalExecutorWorkspaceManager:
         provider: SandboxProvider,
         executor: SandboxExecutorClient,
     ) -> ChatExternalExecutorWorkspaceManager:
-        # Local import keeps the compatibility façade out of the domain module's
-        # import graph while reusing its single, validated dependency assembly.
         from backend.services.chat_sandbox_service import SandboxSessionManager
         from backend.services.chat_durable_lifecycle_observer import (
             durable_lifecycle_observer,
@@ -462,8 +463,15 @@ class ChatExternalExecutorWorkspaceManager:
     ) -> bool:
         try:
             await self.invalidate(workspace)
-        except Exception:
-            # The exact busy fence remains unreusable until reconciliation.
+        except Exception as error:
+            logger.warning(
+                "chat executor workspace invalidation failed "
+                "turn_id=%s chat_session_id=%s failure_class=%s",
+                workspace.turn_id,
+                workspace.session_id,
+                type(error).__name__,
+                exc_info=True,
+            )
             return False
         return True
 

@@ -936,6 +936,31 @@ def test_sponsored_deepseek_requires_production_and_organization_billing(
         runtime_validation.validate_chat_provider_policy(staging)
 
 
+def test_provider_failover_requires_direct_openai_and_the_sponsored_route(
+    settings_factory,
+):
+    production, _release = settings_factory("production")
+    production.chat_openai_direct_enabled = True
+    production.openai_api_key = "test-only"
+    production.chat_gateway_url = (
+        "https://chat-gateway.paperswithcode.co/api/internal/chat-gateway"
+    )
+    production.chat_provider_failover_enabled = True
+    production.chat_title_hf_token = "org-title-token"
+    production.chat_title_bill_to = "huggingface"
+
+    runtime_validation.validate_chat_provider_policy(production)
+
+    production.chat_title_bill_to = "someone-else"
+    with pytest.raises(RuntimeError, match="huggingface-billed title credential"):
+        runtime_validation.validate_chat_provider_policy(production)
+
+    production.chat_title_bill_to = "huggingface"
+    production.chat_openai_direct_enabled = False
+    with pytest.raises(RuntimeError, match="protects direct OpenAI turns"):
+        runtime_validation.validate_chat_provider_policy(production)
+
+
 def test_direct_openai_requires_exact_low_reasoning_warm_profile(settings_factory):
     settings, _release = settings_factory("staging")
     settings.chat_openai_direct_enabled = True
@@ -1431,20 +1456,6 @@ def test_durable_external_profile_requires_tier_consistent_openai_budgets(
     )
     assert runtime_validation._external_pi_capacity_tier(settings) == (
         turns if recognized else None
-    )
-
-
-def test_capacity_tier_openai_allowances_match_the_host_env_helper():
-    from deploy import configure_host_env
-
-    assert {
-        environment: {tier: str(calls) for tier, calls in allowances.items()}
-        for environment, allowances in (
-            runtime_validation._EXTERNAL_PI_OPENAI_RATE_LIMIT_CALLS.items()
-        )
-    } == configure_host_env._CHAT_CAPACITY_TIER_RATE_LIMIT_CALLS
-    assert set(runtime_validation._EXTERNAL_PI_CAPACITY_POLICIES) == set(
-        configure_host_env.CHAT_CAPACITY_TIERS
     )
 
 

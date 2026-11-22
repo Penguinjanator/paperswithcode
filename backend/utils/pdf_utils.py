@@ -2,6 +2,7 @@ from typing import List, Callable, Any, TypeVar
 from contextlib import asynccontextmanager
 import asyncio
 import aiohttp
+import logging
 import tempfile
 import os
 import re
@@ -10,8 +11,11 @@ import fitz
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pdfplumber
+from pdfminer.psexceptions import PSException
+from pdfplumber.utils.exceptions import MalformedPDFException, PdfminerException
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 PROJECT_PAGE_URL_PATTERN = r"\bhttps?://[a-zA-Z0-9.-]+\.github\.io[^\s]*"
 
@@ -73,8 +77,8 @@ def extract_hyperlinks_from_pdf(pdf_path):
                                 text = crop.extract_text() or ""
 
                             links.append({"text": text.strip(), "url": link["uri"]})
-    except Exception as e:
-        print(f"Error extracting hyperlinks from PDF: {e}")
+    except (PdfminerException, MalformedPDFException, PSException):
+        logger.exception("Could not read hyperlinks from PDF %s", pdf_path)
         return []
 
     return links
@@ -92,9 +96,6 @@ async def safe_extract_hyperlinks_async(pdf_path: str, timeout_seconds: int = 10
         return links
     except asyncio.TimeoutError:
         print(f"Hyperlink extraction timed out after {timeout_seconds} seconds")
-        return []
-    except Exception as e:
-        print(f"Error during hyperlink extraction: {e}")
         return []
 
 
@@ -236,7 +237,8 @@ async def async_retry_with_backoff(
     Raises:
         The last exception if all retries are exhausted
     """
-    last_exception = None
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
 
     for attempt in range(max_retries):
         try:
@@ -249,8 +251,6 @@ async def async_retry_with_backoff(
             return result
 
         except retry_exceptions as e:
-            last_exception = e
-
             if attempt == max_retries - 1:
                 print(f"All {max_retries} attempts failed for {operation_name}")
                 raise e
@@ -261,72 +261,56 @@ async def async_retry_with_backoff(
             )
             await asyncio.sleep(delay)
 
-    if last_exception:
-        raise last_exception
-    raise RuntimeError(f"Unexpected error in retry logic for {operation_name}")
+
+class PDFDownloadError(Exception):
+    """An arXiv PDF could not be downloaded; retrying later may succeed."""
+
+
+class PDFNotFoundError(PDFDownloadError):
+    """arXiv has no PDF for the paper."""
 
 
 @asynccontextmanager
 async def temp_pdf_download(arxiv_id: str):
     """
-    Temporarily download a PDF from arXiv asynchronously.
+    Temporarily download a PDF from arXiv and yield its local path.
+
+    Raises PDFNotFoundError when arXiv has no PDF and PDFDownloadError for
+    other download failures.
     """
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=60)
 
-    filepath = None
-    error_message = None
+    async def download_pdf():
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(pdf_url) as response:
+                if response.status in (404, 410):
+                    raise PDFNotFoundError(f"{pdf_url} returned HTTP {response.status}")
+                response.raise_for_status()
+                return await response.read()
+
+    try:
+        content = await async_retry_with_backoff(
+            func=download_pdf,
+            max_retries=3,
+            base_delay=1.0,
+            backoff_factor=2.0,
+            retry_exceptions=(asyncio.TimeoutError, aiohttp.ClientError),
+            operation_name=f"PDF download from {pdf_url}",
+        )
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        raise PDFDownloadError(
+            f"Failed to download {pdf_url}: {type(e).__name__}: {e}"
+        ) from e
+
+    if not _is_valid_pdf_content(content):
+        raise PDFDownloadError(f"{pdf_url} did not return a valid PDF")
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        try:
-            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-
-            timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=60)
-
-            async def download_pdf():
-                """Inner function to download PDF that will be retried."""
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(pdf_url) as response:
-                        response.raise_for_status()
-                        content = await response.read()
-                        print(f"Downloaded {len(content)} bytes")
-                        return content
-
-            content = await async_retry_with_backoff(
-                func=download_pdf,
-                max_retries=3,
-                base_delay=1.0,
-                backoff_factor=2.0,
-                retry_exceptions=(
-                    asyncio.TimeoutError,
-                    aiohttp.ClientError,
-                    aiohttp.ServerTimeoutError,
-                ),
-                operation_name=f"PDF download from {pdf_url}",
-            )
-
-            if not _is_valid_pdf_content(content):
-                raise Exception("Downloaded content is not a valid PDF file")
-
-            filename = f"{arxiv_id}.pdf"
-            filepath = os.path.join(temp_dir, filename)
-
-            with open(filepath, "wb") as f:
-                f.write(content)
-
-            print(f"PDF downloaded successfully to temporary location: {filepath}")
-
-        except Exception as e:
-            error_details = f"{type(e).__name__}: {str(e)}"
-            print(
-                f"An error occurred while downloading PDF at {pdf_url}: {error_details}"
-            )
-            filepath = None
-            error_message = error_details
-
-        try:
-            yield filepath, error_message
-        except GeneratorExit:
-            pass
-        except Exception:
-            pass
+        filepath = os.path.join(temp_dir, f"{arxiv_id.replace('/', '_')}.pdf")
+        with open(filepath, "wb") as f:
+            f.write(content)
+        yield filepath
 
 
 async def find_project_page_url(pdf_path: str) -> str:
