@@ -45,7 +45,7 @@ describe("TopicDialog afterSavePath", () => {
     renderWithProviders(<TopicDialog open afterSavePath="/following" onOpenChange={() => {}} />);
     await userEvent.type(await screen.findByLabelText("Research topic"), "robot learning");
     await userEvent.click(screen.getByRole("button", { name: "Follow" }));
-    expect(await screen.findByText("Following feed")).toBeInTheDocument();
+    expect(await screen.findByText("Following feed", { selector: "div" })).toBeInTheDocument();
     expect(addTopic).toHaveBeenCalledWith("robot learning");
   });
 
@@ -74,9 +74,10 @@ describe("TopicDialog afterSavePath", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
+    await userEvent.click(await screen.findByRole("tab", { name: /Tasks, methods/ }));
     await userEvent.click(await screen.findByRole("button", { name: /Robotics/ }));
     await userEvent.click(screen.getByRole("button", { name: "Follow" }));
-    expect(await screen.findByText("Following feed")).toBeInTheDocument();
+    expect(await screen.findByText("Following feed", { selector: "div" })).toBeInTheDocument();
     expect(firstSeen[0]).toBe(1);
   });
 
@@ -90,6 +91,7 @@ describe("TopicDialog afterSavePath", () => {
       return <TopicDialog open={open} afterSavePath="/following" onOpenChange={setOpen} />;
     }
     renderWithProviders(<Host />);
+    await userEvent.click(await screen.findByRole("tab", { name: /Tasks, methods/ }));
     await userEvent.click(await screen.findByRole("button", { name: /Robotics/ }));
     await userEvent.click(screen.getByRole("button", { name: "Follow" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled());
@@ -120,27 +122,62 @@ describe("TopicDialog feed management", () => {
     ]);
   });
 
-  it("links every chip to its page in a new tab, beside its toggle", async () => {
+  it("links every chip and card to its page, beside its toggle", async () => {
     renderWithProviders(<TopicDialog open onOpenChange={() => {}} />);
-    const links = [
-      ["Open the Real-time video generation page", "/topics/1-real-time-video-generation"],
-      ["Open the OCR releases page", "/topics/23-ocr-releases"],
-      ["Open the Robotics page", "/tasks/robotics"],
-      ["Open the SWE-bench Verified page", "/benchmark/swe-bench-verified"],
-    ];
-    for (const [name, href] of links) {
+    const expectPageLink = async (name: string, href: string) => {
       const link = await screen.findByRole("link", { name });
       expect(link).toHaveAttribute("href", href);
-      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).not.toHaveAttribute("target");
       expect(link.closest("button")).toBeNull();
-    }
+    };
+    // Your topics and popular topics are cards whose title links out.
+    await expectPageLink("Real-time video generation", "/topics/1-real-time-video-generation");
+    await expectPageLink("OCR releases", "/topics/23-ocr-releases");
+    await userEvent.click(screen.getByRole("tab", { name: /Tasks, methods/ }));
+    await expectPageLink("Open the Robotics page", "/tasks/robotics");
+    await expectPageLink("Open the SWE-bench Verified page", "/benchmark/swe-bench-verified");
+  });
+
+  it("lists popular benchmarks below trending methods, after the ones already followed", async () => {
+    vi.spyOn(researchApi, "followSuggestions").mockResolvedValue({ authors: [], organizations: [], benchmarks: [
+      { entity_id: 12, name: "SWE-bench Verified", url: "/benchmark/swe-bench-verified", image_url: null },
+      { entity_id: 45, name: "GSM8K", url: "/benchmark/gsm8k", image_url: null },
+    ] });
+    vi.spyOn(catalogApi, "trendingMethods").mockResolvedValue({ results: [{ id: "3", name: "LoRA", slug: "lora" }] } as never);
+    renderWithProviders(<TopicDialog open onOpenChange={() => {}} />);
+    await userEvent.click(screen.getByRole("tab", { name: /Tasks, methods/ }));
+    const heading = await screen.findByRole("heading", { name: "Popular benchmarks" });
+    const headings = screen.getAllByRole("heading", { level: 3 }).map(node => node.textContent);
+    expect(headings.indexOf("Popular benchmarks")).toBe(headings.indexOf("Trending methods") + 1);
+    const group = within(heading.parentElement!);
+    expect(group.getAllByRole("button").map(node => node.textContent)).toEqual(["SWE-bench Verified", "GSM8K"]);
+    expect(group.getByRole("button", { name: "SWE-bench Verified" })).toHaveAttribute("aria-pressed", "true");
+    expect(group.getByRole("link", { name: "Open the GSM8K page" })).toHaveAttribute("href", "/benchmark/gsm8k");
+  });
+
+  it("links to the following feed and closes on the way there", async () => {
+    const close = vi.fn();
+    renderWithProviders(<TopicDialog open onOpenChange={close} />);
+    const link = await screen.findByRole("link", { name: "Following feed" });
+    expect(link).toHaveAttribute("href", "/following");
+    await userEvent.click(link);
+    expect(close).toHaveBeenCalledWith(false);
+    expect(await screen.findByText("Following feed", { selector: "div" })).toBeInTheDocument();
+  });
+
+  it("links guests to the Following feed too", async () => {
+    auth.value = { user: null, isLoading: false };
+    renderWithProviders(<TopicDialog open onOpenChange={() => {}} />);
+    expect(await screen.findByRole("link", { name: "Following feed" })).toHaveAttribute("href", "/following");
   });
 
   it("names the creator of a followed topic someone else made, not your own", async () => {
     renderWithProviders(<TopicDialog open onOpenChange={() => {}} />);
     const group = (await screen.findByRole("heading", { name: "Your topics" })).parentElement!;
-    expect(await within(group).findByRole("button", { name: /^Speculative decoding/ })).toHaveTextContent("@nielsr");
-    expect(within(group).getByRole("button", { name: /^Real-time video generation/ })).not.toHaveTextContent("@");
+    const card = (name: string) => within(group).getByRole("button", { name }).closest(".home-topic-card")!;
+    await within(group).findByRole("button", { name: "Speculative decoding" });
+    expect(card("Speculative decoding")).toHaveTextContent("by @nielsr");
+    expect(card("Real-time video generation")).not.toHaveTextContent("@");
   });
 
   it("offers popular topics you do not follow yet, with their creator, and follows them on save", async () => {
@@ -149,9 +186,10 @@ describe("TopicDialog feed management", () => {
     const group = (await screen.findByRole("heading", { name: "Popular topics" })).parentElement!;
     // The topic you already follow is not suggested again.
     expect(within(group).queryByRole("button", { name: /Real-time video generation/ })).not.toBeInTheDocument();
-    const chip = within(group).getByRole("button", { name: /OCR releases/ });
-    expect(chip).toHaveTextContent("@nielsr");
-    fireEvent.click(chip);
+    const card = within(group).getByRole("button", { name: "Follow OCR releases" }).closest("li")!;
+    expect(card).toHaveTextContent("by @nielsr");
+    expect(card).toHaveTextContent("5 followers");
+    fireEvent.click(within(card).getByRole("button", { name: "Follow OCR releases" }));
     fireEvent.click(screen.getByRole("button", { name: "Follow" }));
     await waitFor(() => expect(follow).toHaveBeenCalledWith(23));
   });

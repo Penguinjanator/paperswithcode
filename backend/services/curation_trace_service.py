@@ -25,30 +25,80 @@ from backend.models.database import PaperCurationJob, PaperCurationSchedulerStat
 
 logger = logging.getLogger(__name__)
 
+SECRET_NAME = r"(?:authorization|api[-_]?key|token|secret|password)"
+SECRET_KEY = re.compile(SECRET_NAME + r"$", re.IGNORECASE)
 SECRET_PATTERNS = (
     re.compile(
-        r"(?i)(authorization|api[-_]?key|token|secret|password)(\s*[:=]\s*)([^\s\"']+)"
+        r"(" + SECRET_NAME + r")"
+        r"(\\*\"\s*[:=]\s*\\*\"|\s*[:=]\s*(?:\\*\")?)"
+        r"([^\s\"'\\,:{}\[\]][^\s\"'\\,{}\[\]]*)",
+        re.IGNORECASE,
     ),
     re.compile(r"\b(?:hf|sk)-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),
 )
 MAX_TRACE_BYTES = 8_000_000
 MAX_EXPANDED_TRACE_BYTES = 32_000_000
 UPLOAD_TIMEOUT_SECONDS = 180
 UPLOAD_WORKER = Path(__file__).with_name("curation_trace_upload_worker.py")
+SESSION_OBJECT = "session.jsonl"
+HUB_BUCKET_URI_PREFIX = "hf://buckets/"
 
 
-def redact_trace(raw: bytes) -> bytes:
-    text = raw.decode("utf-8", "replace")
+def _redact_text(text: str) -> str:
     for pattern in SECRET_PATTERNS:
         if pattern.groups >= 3:
             text = pattern.sub(r"\1\2<redacted>", text)
         else:
             text = pattern.sub("<redacted>", text)
-    return text.encode()
+    return text
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>"
+            if SECRET_KEY.search(key) and isinstance(item, str) and item
+            else _redact_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _redact_line(line: str) -> str:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return _redact_text(line)
+    return json.dumps(_redact_value(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def redact_trace(raw: bytes) -> bytes:
+    """Redact secrets line by line, re-serializing JSON lines so JSONL stays valid."""
+    text = raw.decode("utf-8", "replace")
+    return "\n".join(_redact_line(line) for line in text.split("\n")).encode()
 
 
 def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def trace_folder_url(trace_uri: str | None) -> str | None:
+    """Hub page listing a job's trace objects, from its ``hf://buckets`` manifest URI."""
+    if not trace_uri or not trace_uri.startswith(HUB_BUCKET_URI_PREFIX):
+        return None
+    bucket_path, _, _ = trace_uri.removeprefix(HUB_BUCKET_URI_PREFIX).rpartition("/")
+    owner, name, folder = bucket_path.split("/", 2)
+    return f"https://huggingface.co/buckets/{owner}/{name}/tree/{folder}"
+
+
+def agent_trace_url(trace_uri: str | None, session_sha256: str | None) -> str | None:
+    folder = trace_folder_url(trace_uri)
+    return f"{folder}/{SESSION_OBJECT}" if folder and session_sha256 else None
 
 
 def _ordered_trace_value(value: Any) -> Any:
@@ -243,6 +293,10 @@ class CurationTraceService:
                 row.url_candidates or [], sort_keys=True
             ).encode(),
         }
+        if payload.get("session_gzip_b64"):
+            object_values[SESSION_OBJECT] = self.decode_events(
+                payload["session_gzip_b64"]
+            )
         manifest["objects"] = {
             name: sha256(data) for name, data in object_values.items()
         }
@@ -260,6 +314,8 @@ class CurationTraceService:
         )
         row.trace_uri = result.get("uri") or row.trace_uri
         row.trace_sha256 = sha256(manifest_bytes)
+        if result["status"] == "stored" and SESSION_OBJECT in object_values:
+            row.trace_session_sha256 = sha256(object_values[SESSION_OBJECT])
         if row.mutation_result is None:
             row.mutation_result = payload.get("result")
         usage = payload.get("usage") or {}

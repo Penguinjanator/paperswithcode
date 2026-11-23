@@ -1,11 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { ArrowRight, ArrowUpRight, Check, Pencil, Plus, Trash2, Undo2 } from 'lucide-react';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { Switch } from '@/components/ui/switch';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import TopicCard from '@/components/TopicCard';
 import SortableList from '@/components/SortableList';
 import { hfLoginUrl } from '@/lib/apiUrl';
+import { saveTopicDialog, type TopicDialogSnapshot } from '@/lib/topicDialogSnapshot';
 import {
   TOPIC_LIMIT, TOPIC_MAX_LENGTH, type FollowKind, type FollowSuggestion, type ResearchTopic,
 } from '@/lib/api/research';
@@ -14,7 +17,7 @@ import { useDebounce } from '@/hooks/useDebounce';
 import { displayTaskName } from '@/lib/transform';
 import { catalogQueries, researchQueries } from '@/lib/api/queries';
 import {
-  isConflict, stashPendingFollows, stashPendingTopic, stashPendingTopicFollows, topicPath, topicTitle, useFollowTopic,
+  isConflict, stashPendingFollows, stashPendingTopic, stashPendingTopicFollows, topicTitle, useFollowTopic,
   useRemoveTopics, useReorderTopics, useResearchFollows, useResearchTopics, useSaveFollows, useSaveTopic,
   useSetTopicPublic, type FollowPick,
 } from '@/lib/researchTopic';
@@ -22,38 +25,42 @@ import {
 // Suggestions fetched per group; each group shows as many as fit in two rows, after everything already followed,
 // and links to its full listing for more.
 const SUGGESTIONS_PER_GROUP = 16;
-// Popular topics offered after hiding the account's own and followed ones.
-const POPULAR_TOPICS = 5;
+// Popular topics offered as cards after hiding the account's own and followed ones; two rows of the dialog's grid.
+const POPULAR_TOPICS = 6;
 
-/** Edits the Following feed in a pop-up, the one place to manage it: write a new topic or reword one, reorder,
- * unfollow, or make your topics private, and follow popular topics, trending tasks and methods, benchmarks,
- * popular authors, and organizations. Every chip links to its page in a new tab, so a look never loses unsaved picks.
+/** Edits the Following feed in a pop-up, the one place to manage it. The Topics tab (the default) writes a new topic
+ * or rewords one, reorders, unfollows, or makes your topics private, and offers popular topics as cards; the second
+ * tab follows trending tasks and methods, benchmarks, popular authors, and organizations. Every chip and card links
+ * to its page; following a link saves the pop-up as it is, and Back reopens it there with its unsaved picks
+ * (`restore`).
  * Nothing is saved until Save. Guests sign in on submit, and /following saves what they picked when they return.
  * Opened elsewhere, `afterSavePath` (/following) is where a save leads and where guests return after signing in. */
-export default function TopicDialog({ open, topicId = null, afterSavePath, onOpenChange }: {
+export default function TopicDialog({ open, topicId = null, afterSavePath, restore, onOpenChange }: {
   open: boolean;
   topicId?: number | null;
   afterSavePath?: string;
+  restore?: TopicDialogSnapshot | null;
   onOpenChange: (open: boolean) => void;
 }) {
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent className="topic-dialog" aria-describedby={undefined}>
-      <TopicDialogForm key={topicId ?? 'new'} topicId={topicId} afterSavePath={afterSavePath} onDone={() => onOpenChange(false)} />
+      <TopicDialogForm key={topicId ?? 'new'} topicId={topicId} afterSavePath={afterSavePath} restore={restore}
+        onDone={() => onOpenChange(false)} />
     </DialogContent>
   </Dialog>;
 }
 
-/** Opens a chip's page in a new tab, beside (never inside) the chip's toggle. */
+/** Opens a chip's page, beside (never inside) the chip's toggle. */
 function PageLink({ to, name }: { to: string; name: string }) {
-  return <a className="topic-dialog-chip-open" href={to} target="_blank" rel="noopener noreferrer"
-    aria-label={`Open the ${name} page`} title="Open its page in a new tab">
+  return <Link className="topic-dialog-chip-open" to={to} aria-label={`Open the ${name} page`} title="Open its page">
     <ArrowUpRight aria-hidden="true" />
-  </a>;
+  </Link>;
 }
 
-function TopicDialogForm({ topicId, afterSavePath, onDone }: {
+function TopicDialogForm({ topicId, afterSavePath, restore, onDone }: {
   topicId: number | null;
   afterSavePath?: string;
+  restore?: TopicDialogSnapshot | null;
   onDone: () => void;
 }) {
   const { user } = useAuth();
@@ -64,23 +71,45 @@ function TopicDialogForm({ topicId, afterSavePath, onDone }: {
   const follows = useResearchFollows();
   const tasks = useQuery(catalogQueries.trendingTasks({ limit: SUGGESTIONS_PER_GROUP, level: 0 }));
   const methods = useQuery(catalogQueries.trendingMethods({ limit: SUGGESTIONS_PER_GROUP }));
-  // Popular authors and the directory's top organizations, with faces and logos.
+  // Popular authors, the directory's top organizations, and the benchmarks most reported on lately.
   const suggestions = useQuery(researchQueries.followSuggestions());
   const featured = useQuery(researchQueries.featuredTopics());
   const suggested = (items: FollowSuggestion[] = []) =>
     items.map(item => ({ id: String(item.entity_id), name: item.name, image: item.image_url, url: item.url }));
   // The topic loaded into the text box: one being reworded, or null for a new one.
-  const [editId, setEditId] = useState(topicId);
-  const [draft, setDraft] = useState<string | null>(null);
+  const [editId, setEditId] = useState(restore ? restore.editId : topicId);
+  const [draft, setDraft] = useState<string | null>(restore?.draft ?? null);
   // The follow state chosen per chip; submit sends only those that differ from the current follows,
   // so chips stay right when a partial save refreshes the follows.
-  const [selection, setSelection] = useState<FollowPick[]>([]);
+  const [selection, setSelection] = useState<FollowPick[]>(restore?.selection ?? []);
   // Followed topics show as chips; unselecting one removes it on submit.
-  const [removals, setRemovals] = useState<number[]>([]);
+  const [removals, setRemovals] = useState<number[]>(restore?.removals ?? []);
   // Popular topics picked to follow, a new order for your topics, and public/private switches, all saved on submit.
-  const [topicFollows, setTopicFollows] = useState<number[]>([]);
-  const [order, setOrder] = useState<ResearchTopic[] | null>(null);
-  const [privacy, setPrivacy] = useState<Record<number, boolean>>({});
+  const [topicFollows, setTopicFollows] = useState<number[]>(restore?.topicFollows ?? []);
+  const [order, setOrder] = useState<ResearchTopic[] | null>(restore?.order ?? null);
+  const [privacy, setPrivacy] = useState<Record<number, boolean>>(restore?.privacy ?? {});
+  // Picks on either tab survive switching: both tabs' state lives here.
+  const [tab, setTab] = useState(restore?.tab ?? 'topics');
+  const form = useRef<HTMLFormElement>(null);
+  // The scroll position to return to, applied once the restored pop-up is tall enough to reach it.
+  const pendingScroll = useRef(restore?.scrollTop ?? 0);
+  useLayoutEffect(() => {
+    const scroller = form.current?.closest<HTMLElement>('.topic-dialog');
+    if (!pendingScroll.current || !scroller) return;
+    if (scroller.scrollHeight - scroller.clientHeight < pendingScroll.current) return;
+    scroller.scrollTop = pendingScroll.current;
+    pendingScroll.current = 0;
+  });
+  // A plain click on a link to another page of the site keeps the pop-up for Back.
+  const keepForBack = (event: MouseEvent) => {
+    const link = (event.target as Element).closest('a');
+    if (!link || link.target === '_blank' || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey
+      || event.altKey || new URL(link.href, window.location.href).origin !== window.location.origin) return;
+    saveTopicDialog({
+      topicId, editId, draft, selection, removals, topicFollows, order, privacy, tab,
+      scrollTop: form.current?.closest<HTMLElement>('.topic-dialog')?.scrollTop ?? 0,
+    });
+  };
   const saveTopic = useSaveTopic();
   const removeTopics = useRemoveTopics();
   const saveFollows = useSaveFollows();
@@ -226,123 +255,139 @@ function TopicDialogForm({ topicId, afterSavePath, onDone }: {
     </div>;
   };
   const editingPublic = editing ? privacy[editing.id] ?? editing.is_public : true;
-  return <form className="topic-dialog-form" onSubmit={event => {
+  return <form ref={form} className="topic-dialog-form" onClickCapture={keepForBack} onSubmit={event => {
     event.preventDefault();
     submit();
   }}>
     <DialogTitle className="topic-dialog-title">
       {topics.data?.length || follows.data?.length ? 'Edit your research feed' : 'Build your research feed'}
     </DialogTitle>
-    <div className="topic-dialog-group">
-      <h3><label htmlFor="topic-dialog-input">
-        {editing ? `Reword “${topicTitle(editing)}”` : topics.data?.length ? 'Add a topic in your own words' : 'Describe a topic in your own words'}
-      </label></h3>
-      <p className="topic-dialog-hint">
-        {!editing && atLimit ? `You follow ${TOPIC_LIMIT} topics, the most allowed. Remove one below to add another.`
-          : 'A model reads every new paper and adds the ones that match to your Following feed. New topics are public and show your Hugging Face username; make one private from its ✎ button below, or remove one with its trash button.'}
-      </p>
-      <textarea id="topic-dialog-input" className="research-topic-input" rows={4} maxLength={TOPIC_MAX_LENGTH}
-        aria-label="Research topic"
-        placeholder="e.g. diffusion policies for robot manipulation, or speculative decoding for LLM inference"
-        value={value} onChange={event => setDraft(event.target.value)}
-        onKeyDown={event => {
-          if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            submit();
-          }
-        }} />
-      <span className="research-topic-count">{value.length}/{TOPIC_MAX_LENGTH}</span>
-      {duplicates.length > 0 && <div className="topic-dialog-duplicate" role="status">
-        <p>
-          Papers with Code already has {duplicates.length > 1 ? 'pages' : `a ${duplicates[0].kind} page`} for
-          “{trimmed}”. Follow {duplicates.length > 1 ? 'one' : 'it'} instead of adding a topic:
-        </p>
-        <div className="topic-dialog-chips">
-          {duplicates.map(match => {
-            const id = String(match.entity_id);
-            const on = isSelected(match.kind, id);
-            return <span key={`${match.kind}:${id}`} className="topic-dialog-chip-wrap">
-              <button type="button" className="topic-dialog-chip" aria-pressed={on} disabled={saving}
-                onClick={() => toggle(match.kind, id, match.name)}>
-                {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
-                {match.name}
-              </button>
-              <PageLink to={match.url} name={match.name} />
-            </span>;
-          })}
-        </div>
-      </div>}
-      {editing && <div className="topic-dialog-editing">
-        {editing.is_creator && <label className="topic-dialog-privacy">
-          <Switch checked={editingPublic} disabled={saving} aria-label="Public topic"
-            onCheckedChange={checked => setPrivacy(current => ({ ...current, [editing.id]: checked }))} />
-          {editingPublic ? 'Public: anyone can find and follow it' : 'Private: only you see it'}
-        </label>}
-        <button type="button" className="link-button" disabled={saving} onClick={() => startEditing(null)}>
-          Add a new topic instead
-        </button>
-      </div>}
-    </div>
-    {ownTopics.length > 0 && <div className="topic-dialog-group">
-      <h3>Your topics</h3>
-      <SortableList
-        className="topic-dialog-topic-list"
-        items={orderedTopics}
-        itemKey={topic => topic.id}
-        itemLabel={topic => topicTitle(topic)}
-        disabled={saving}
-        onReorder={setOrder}
-        renderItem={(topic, handle) => {
-          const on = !removals.includes(topic.id);
-          const toggleRemoval = () => setRemovals(current => on ? [...current, topic.id] : current.filter(id => id !== topic.id));
-          return <div className={`topic-dialog-topic ${topic.id === editId ? 'is-editing' : ''} ${on ? '' : 'is-removed'}`}>
-            {handle}
-            <span className="topic-dialog-chip-wrap">
-              <button type="button" className="topic-dialog-chip" aria-pressed={on} disabled={saving} title={topic.text}
-                onClick={toggleRemoval}>
-                {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
-                {topicTitle(topic)}
-                {topic.creator && <span className="topic-dialog-chip-creator">@{topic.creator.username}</span>}
-              </button>
-              <button type="button" className="topic-dialog-chip-open" disabled={saving || topic.id === editId}
-                aria-label={`Reword ${topicTitle(topic)}`} title="Reword this topic" onClick={() => startEditing(topic.id)}>
-                <Pencil aria-hidden="true" />
-              </button>
-              <PageLink to={topicPath(topic)} name={topicTitle(topic)} />
-              <button type="button" className="topic-dialog-chip-open topic-dialog-chip-remove" disabled={saving}
-                aria-label={on ? `Remove ${topicTitle(topic)}` : `Keep ${topicTitle(topic)}`}
-                title={on ? 'Remove from your feed on Save' : 'Keep this topic'} onClick={toggleRemoval}>
-                {on ? <Trash2 aria-hidden="true" /> : <Undo2 aria-hidden="true" />}
-              </button>
-            </span>
-          </div>;
-        }}
-      />
-    </div>}
-    {popularTopics.length > 0 && <div className="topic-dialog-group">
-      <h3>Popular topics</h3>
-      <div className="topic-dialog-chips">
-        {popularTopics.map(topic => {
-          const on = topicFollows.includes(topic.id);
-          return <span key={topic.id} className="topic-dialog-chip-wrap">
-            <button type="button" className="topic-dialog-chip" aria-pressed={on} disabled={saving || (!on && atLimit)}
-              title={topic.text}
-              onClick={() => setTopicFollows(current => on ? current.filter(id => id !== topic.id) : [...current, topic.id])}>
-              {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
-              {topicTitle(topic)}
-              {topic.creator && <span className="topic-dialog-chip-creator">@{topic.creator.username}</span>}
+    <Tabs value={tab} onValueChange={setTab} className="topic-dialog-tabs">
+      <TabsList className="topic-dialog-tab-list">
+        <TabsTrigger value="topics" className="topic-dialog-tab">
+          Topics<TabCount count={pendingTopicFollows.length + pendingRemovals.length} />
+        </TabsTrigger>
+        <TabsTrigger value="catalog" className="topic-dialog-tab">
+          Tasks, methods &amp; more<TabCount count={changes.length} />
+        </TabsTrigger>
+      </TabsList>
+      <TabsContent value="topics" className="topic-dialog-panel">
+        <div className="topic-dialog-group">
+          <h3><label htmlFor="topic-dialog-input">
+            {editing ? `Reword “${topicTitle(editing)}”` : topics.data?.length ? 'Add a topic in your own words' : 'Describe a topic in your own words'}
+          </label></h3>
+          <p className="topic-dialog-hint">
+            {!editing && atLimit ? `You follow ${TOPIC_LIMIT} topics, the most allowed. Remove one below to add another.`
+              : <>
+                A model reads every new paper and adds the ones that match to your <Link to="/following"
+                  className="topic-dialog-feed-link" onClick={onDone}>Following feed</Link>. New topics are public and show your Hugging Face username; make one private from
+                its ✎ button below, or remove one with its trash button.
+              </>}
+          </p>
+          <textarea id="topic-dialog-input" className="research-topic-input" rows={4} maxLength={TOPIC_MAX_LENGTH}
+            aria-label="Research topic"
+            placeholder="e.g. diffusion policies for robot manipulation, or speculative decoding for LLM inference"
+            value={value} onChange={event => setDraft(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submit();
+              }
+            }} />
+          <span className="research-topic-count">{value.length}/{TOPIC_MAX_LENGTH}</span>
+          {duplicates.length > 0 && <div className="topic-dialog-duplicate" role="status">
+            <p>
+              Papers with Code already has {duplicates.length > 1 ? 'pages' : `a ${duplicates[0].kind} page`} for
+              “{trimmed}”. Follow {duplicates.length > 1 ? 'one' : 'it'} instead of adding a topic:
+            </p>
+            <div className="topic-dialog-chips">
+              {duplicates.map(match => {
+                const id = String(match.entity_id);
+                const on = isSelected(match.kind, id);
+                return <span key={`${match.kind}:${id}`} className="topic-dialog-chip-wrap">
+                  <button type="button" className="topic-dialog-chip" aria-pressed={on} disabled={saving}
+                    onClick={() => toggle(match.kind, id, match.name)}>
+                    {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}
+                    {match.name}
+                  </button>
+                  <PageLink to={match.url} name={match.name} />
+                </span>;
+              })}
+            </div>
+          </div>}
+          {editing && <div className="topic-dialog-editing">
+            {editing.is_creator && <label className="topic-dialog-privacy">
+              <Switch checked={editingPublic} disabled={saving} aria-label="Public topic"
+                onCheckedChange={checked => setPrivacy(current => ({ ...current, [editing.id]: checked }))} />
+              {editingPublic ? 'Public: anyone can find and follow it' : 'Private: only you see it'}
+            </label>}
+            <button type="button" className="link-button" disabled={saving} onClick={() => startEditing(null)}>
+              Add a new topic instead
             </button>
-            <PageLink to={topicPath(topic)} name={topicTitle(topic)} />
-          </span>;
-        })}
-      </div>
-    </div>}
-    {chips('Trending tasks', 'task', tasks.data?.results ?? [], { to: '/tasks', label: 'Browse tasks' })}
-    {chips('Trending methods', 'method', methods.data?.results ?? [], { to: '/methods', label: 'Browse methods' })}
-    {chips('Benchmarks', 'benchmark', [], { to: '/tasks', label: 'Browse benchmarks' })}
-    {chips('Popular authors', 'author', suggested(suggestions.data?.authors))}
-    {chips('Popular organizations', 'organization', suggested(suggestions.data?.organizations),
-      { to: '/organizations', label: 'Browse organizations' })}
+          </div>}
+        </div>
+        {ownTopics.length > 0 && <div className="topic-dialog-group">
+          <h3>Your topics</h3>
+          <SortableList
+            className="home-topics-list topic-dialog-topic-cards"
+            grid
+            items={orderedTopics}
+            itemKey={topic => topic.id}
+            itemLabel={topic => topicTitle(topic)}
+            disabled={saving}
+            onReorder={setOrder}
+            renderItem={(topic, handle) => {
+              const on = !removals.includes(topic.id);
+              const title = topicTitle(topic);
+              const toggleRemoval = () => setRemovals(current => on ? [...current, topic.id] : current.filter(id => id !== topic.id));
+              return <TopicCard as="div" topic={topic} showCreator
+                className={`topic-dialog-own-topic ${topic.id === editId ? 'is-editing' : ''} ${on ? '' : 'is-removed'}`}
+                action={<div className="topic-dialog-card-actions">
+                  <button type="button" className={`home-topic-follow ${on ? 'is-following' : ''}`} aria-pressed={on}
+                    aria-label={title} title={on ? 'Remove from your feed on Save' : 'Keep this topic'} disabled={saving}
+                    onClick={toggleRemoval}>
+                    {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}{on ? 'Following' : 'Follow'}
+                  </button>
+                  <button type="button" className="topic-dialog-chip-open" disabled={saving || topic.id === editId}
+                    aria-label={`Reword ${title}`} title="Reword this topic" onClick={() => startEditing(topic.id)}>
+                    <Pencil aria-hidden="true" />
+                  </button>
+                  <button type="button" className="topic-dialog-chip-open topic-dialog-chip-remove" disabled={saving}
+                    aria-label={on ? `Remove ${title}` : `Keep ${title}`}
+                    title={on ? 'Remove from your feed on Save' : 'Keep this topic'} onClick={toggleRemoval}>
+                    {on ? <Trash2 aria-hidden="true" /> : <Undo2 aria-hidden="true" />}
+                  </button>
+                  <span className="topic-dialog-card-handle">{handle}</span>
+                </div>} />;
+            }}
+          />
+        </div>}
+        {popularTopics.length > 0 && <div className="topic-dialog-group">
+          <h3>Popular topics</h3>
+          <ul className="home-topics-list topic-dialog-topic-cards">
+            {popularTopics.map(topic => {
+              const on = topicFollows.includes(topic.id);
+              return <TopicCard key={topic.id} topic={topic} showCreator action={
+                <button type="button" className={`home-topic-follow ${on ? 'is-following' : ''}`} aria-pressed={on}
+                  aria-label={`Follow ${topicTitle(topic)}`} disabled={saving || (!on && atLimit)}
+                  onClick={() => setTopicFollows(current => on ? current.filter(id => id !== topic.id) : [...current, topic.id])}>
+                  {on ? <Check aria-hidden="true" /> : <Plus aria-hidden="true" />}{on ? 'Following' : 'Follow'}
+                </button>
+              } />;
+            })}
+          </ul>
+        </div>}
+      </TabsContent>
+      <TabsContent value="catalog" className="topic-dialog-panel">
+        {chips('Trending tasks', 'task', tasks.data?.results ?? [], { to: '/tasks', label: 'Browse tasks' })}
+        {chips('Trending methods', 'method', methods.data?.results ?? [], { to: '/methods', label: 'Browse methods' })}
+        {chips('Popular benchmarks', 'benchmark', suggested(suggestions.data?.benchmarks),
+          { to: '/tasks', label: 'Browse benchmarks' })}
+        {chips('Popular authors', 'author', suggested(suggestions.data?.authors))}
+        {chips('Popular organizations', 'organization', suggested(suggestions.data?.organizations),
+          { to: '/organizations', label: 'Browse organizations' })}
+      </TabsContent>
+    </Tabs>
     {refusal && <p className="settings-token-error" role="alert">{refusal.message}.</p>}
     {((saveTopic.error && !isConflict(saveTopic.error)) || removeTopics.error || saveFollows.error || followTopic.error
       || reorderTopics.error || setTopicPublic.error) && <p className="settings-token-error" role="alert">
@@ -356,6 +401,11 @@ function TopicDialogForm({ topicId, afterSavePath, onDone }: {
       </button>
     </div>
   </form>;
+}
+
+/** How many unsaved picks a tab holds, so a switch never hides them. */
+function TabCount({ count }: { count: number }) {
+  return count > 0 ? <span className="topic-dialog-tab-count" aria-label={`${count} unsaved`}>{count}</span> : null;
 }
 
 /** Wraps chips, hiding trailing suggestions until followed chips, suggestions, and the browse link fit in two rows. */

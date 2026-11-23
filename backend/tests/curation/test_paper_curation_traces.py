@@ -18,7 +18,9 @@ from backend.models.database import (
 )
 from backend.services.curation_trace_service import (
     CurationTraceService,
+    agent_trace_url,
     redact_trace,
+    trace_folder_url,
     trace_json,
 )
 
@@ -32,6 +34,47 @@ def test_trace_redaction_removes_planted_credentials():
     assert "sk-example" not in redacted
     assert "hf-example" not in redacted
     assert redacted.count("<redacted>") >= 3
+
+
+def test_trace_redaction_keeps_every_jsonl_line_parseable():
+    hf_token = "hf_" + "A1b2C3d4E5" * 4
+    lines = [
+        {"cmd": 'token = os.environ["PWC_CURATION_JOB_TOKEN"]'},
+        {"token": hf_token, "max_tokens": 32768},
+        {"output": json.dumps({"api_key": "plain-secret-value"})},
+        {"path": "backend/services/hf_artifact_service.py"},
+        {"id_token": None, "password": 1234, "secret": True, "api_key": {"v": 1}},
+        {"output": json.dumps({"refresh_token": None, "token": "nested-secret"})},
+        {"cmd": 'export HF_TOKEN="quoted-assignment-secret" PASSWORD=bare-secret'},
+        {"msg": "token=", "x": 1},
+        {"a": "token=", "b": "c"},
+        {"output": json.dumps({"a": "token=", "b": "c", "token=": "v", "n": 1})},
+    ]
+    raw = "\n".join(json.dumps(line) for line in lines).encode()
+
+    redacted = redact_trace(raw).decode()
+
+    parsed = [json.loads(line) for line in redacted.splitlines()]
+    assert hf_token not in redacted
+    assert "plain-secret-value" not in redacted
+    assert parsed[0]["cmd"].endswith('"PWC_CURATION_JOB_TOKEN"]')
+    assert parsed[1] == {"token": "<redacted>", "max_tokens": 32768}
+    assert parsed[3] == lines[3]
+    assert parsed[4] == lines[4]
+    assert "nested-secret" not in redacted
+    assert json.loads(parsed[5]["output"])["refresh_token"] is None
+    assert parsed[6]["cmd"] == 'export HF_TOKEN="<redacted>" PASSWORD=<redacted>'
+    assert parsed[7:] == lines[7:]
+    assert json.loads(parsed[9]["output"]) == json.loads(lines[9]["output"])
+
+
+def test_unparseable_trace_lines_still_redact_escaped_secrets():
+    truncated = b'{"output": "{\\"api_key\\": \\"escaped-secret\\", \\"token\\": \\"other-secret'
+
+    redacted = redact_trace(truncated).decode()
+
+    assert "escaped-secret" not in redacted
+    assert "other-secret" not in redacted
 
 
 def test_checked_in_proposal_schema_requires_benchmark_gaps():
@@ -212,3 +255,79 @@ def test_finalize_cannot_replace_the_server_recorded_mutation_result(
         "status": "resolved",
         "paper_id": 999,
     }
+
+
+def test_finalize_stores_the_agent_session_for_the_hub_trace_viewer(
+    tmp_path, monkeypatch
+):
+    class Database:
+        def commit(self):
+            pass
+
+        def refresh(self, _row, *, with_for_update):
+            assert with_for_update
+
+        def get(self, *_args):
+            return None
+
+    uploaded = {}
+    monkeypatch.setattr(
+        "backend.services.curation_trace_service.upload_trace_objects",
+        lambda _bucket, prefix, objects, *, token: uploaded.update(objects),
+    )
+    settings = get_settings().model_copy(
+        update={
+            "codex_curation_trace_upload_enabled": True,
+            "codex_curation_trace_hf_bucket_id": "example/curate-papers-traces",
+            "codex_add_evals_spool_dir": str(tmp_path),
+        }
+    )
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        paper_id=42,
+        cohort_date=None,
+        parent_workflow_id=None,
+        repository_sha="a" * 40,
+        skill_sha256="b" * 64,
+        prompt_sha256=None,
+        model="gpt-5.6-luna",
+        reasoning_effort="medium",
+        codex_cli_version="0.75.0",
+        policy_version="admin-v1",
+        proposal=None,
+        url_candidates=None,
+        trace_uri=None,
+        trace_session_sha256=None,
+        mutation_result=None,
+    )
+    session = b'{"type":"session_meta","payload":{"command":"api_key=hunter2secret"}}\n'
+    encode = lambda raw: base64.b64encode(gzip.compress(raw)).decode()  # noqa: E731
+
+    CurationTraceService(Database(), settings, hf_api=object()).finalize(
+        row,
+        {
+            "events_gzip_b64": encode(b'{"type":"done"}\n'),
+            "session_gzip_b64": encode(session),
+            "report": "",
+        },
+    )
+
+    stored = uploaded["session.jsonl"]
+    assert b"hunter2secret" not in stored
+    assert json.loads(uploaded["manifest.json"])["objects"]["session.jsonl"] == (
+        row.trace_session_sha256
+    )
+    assert agent_trace_url(row.trace_uri, row.trace_session_sha256) == (
+        "https://huggingface.co/buckets/example/curate-papers-traces/tree/"
+        f"traces/admin-v1/admin/42/{row.id}/session.jsonl"
+    )
+
+
+def test_trace_links_point_at_the_bucket_folder_only_for_bucket_traces():
+    uri = "hf://buckets/nielsr/curate-papers-traces/traces/admin-v1/admin/7/job/manifest.json"
+    folder = "https://huggingface.co/buckets/nielsr/curate-papers-traces/tree/traces/admin-v1/admin/7/job"
+
+    assert trace_folder_url(uri) == folder
+    assert agent_trace_url(uri, None) is None
+    assert trace_folder_url(None) is None
+    assert trace_folder_url("s3://elsewhere/manifest.json") is None
