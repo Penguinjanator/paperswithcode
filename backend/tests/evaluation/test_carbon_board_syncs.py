@@ -382,6 +382,8 @@ def test_every_board_has_identities_and_a_configured_fetcher():
         "sync_swe_marathon",
         "sync_jevbench",
         "sync_rsi_exam",
+        "sync_frontier_rsi",
+        "sync_rsi_infra",
     }
     for job, sync in boards.BOARD_SYNCS.items():
         assert len(sync.board.identities) >= sync.board.min_selected
@@ -391,6 +393,8 @@ def test_every_board_has_identities_and_a_configured_fetcher():
             "sync_swe_marathon",
             "sync_jevbench",
             "sync_rsi_exam",
+            "sync_frontier_rsi",
+            "sync_rsi_infra",
         ):
             assert sync.board.identities is IDENTITIES[sync.board.dataset_slug]
 
@@ -586,6 +590,76 @@ def test_sync_skips_excluded_names_and_reports_rows_that_leave_upstream():
     assert len(rows) == 2
 
 
+def test_sync_deletes_unannotated_rows_that_leave_upstream():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    annotated = _rows(session)["Claude Opus 5.5 (mini-SWE-agent)"]
+    annotated.methodology += " Reviewer checked the run logs."
+    session.commit()
+
+    stats = LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Sol 5.6 (high)", 3.1), _entry("Opus 5.5 (xhigh)", 3.7, "Codex")]
+    )
+
+    assert stats.deleted == []
+    assert stats.missing_upstream == ["Claude Opus 5.5 (mini-SWE-agent)"]
+    assert "Claude Opus 5.5 (mini-SWE-agent)" in _rows(session)
+
+    gone = LiveLeaderboardSyncService(session, _board(min_selected=1)).sync(
+        [_entry("Sol 5.6 (high)", 3.1)]
+    )
+    assert gone.deleted == ["Claude Opus 5.5 (Codex)"]
+    assert gone.missing_upstream == ["Claude Opus 5.5 (mini-SWE-agent)"]
+    assert set(_rows(session)) == {
+        "Claude Opus 5.5 (mini-SWE-agent)",
+        "GPT-5.6 Sol (mini-SWE-agent)",
+    }
+
+
+def test_boards_that_trim_old_models_report_instead_of_deleting():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 3.61), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    stats = LiveLeaderboardSyncService(
+        session, _board(min_selected=1, retire_missing=False)
+    ).sync([_entry("Sol 5.6 (high)", 3.1)])
+    assert stats.deleted == []
+    assert stats.missing_upstream == ["Claude Opus 5.5 (mini-SWE-agent)"]
+    assert "Claude Opus 5.5 (mini-SWE-agent)" in _rows(session)
+
+
+def test_aa_boards_keep_models_they_stop_listing():
+    assert {
+        job for job, sync in boards.BOARD_SYNCS.items() if not sync.board.retire_missing
+    } == {"sync_critpt", "sync_critpt_v2", "sync_terminal_bench_science"}
+
+
+def test_rows_carrying_another_boards_metric_only_lose_this_metric():
+    session = _session()
+    LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 5.0), _entry("Sol 5.6 (xhigh)", 4.7)]
+    )
+    sol = _rows(session)["GPT-5.6 Sol (mini-SWE-agent)"]
+    sol.metrics = {**sol.metrics, "Other": 1.0}
+    session.commit()
+    assert sol.best_rank == 2
+
+    stats = LiveLeaderboardSyncService(session, _board()).sync(
+        [_entry("Opus 5.5 (xhigh)", 5.0), _entry("Sol 5.6 (high)", 3.1, "Codex")]
+    )
+
+    assert stats.deleted == ["GPT-5.6 Sol (mini-SWE-agent)"]
+    sol = _rows(session)["GPT-5.6 Sol (mini-SWE-agent)"]
+    assert (sol.metrics, sol.best_metric, sol.best_rank) == (
+        {"Other": 1.0},
+        "Other",
+        1,
+    )
+
+
 def test_sync_reports_unknown_models_to_the_release_radar():
     session = _session()
     stats = LiveLeaderboardSyncService(session, _board()).sync(
@@ -599,6 +673,72 @@ def test_sync_reports_unknown_models_to_the_release_radar():
     )
     assert stats.unreviewed == ["Mystery 9 (mini-SWE-agent)"]
     assert session.query(ModelReleaseSignal).count() == 1
+
+
+def _add_release(session: Session) -> ModelRelease:
+    release = ModelRelease(
+        id=7,
+        paper_id=2,
+        canonical_name="Mythos 7",
+        publisher="Anthropic",
+        aliases=[],
+        is_open=False,
+    )
+    session.add(release)
+    session.commit()
+    return release
+
+
+@pytest.mark.parametrize(
+    ("effort_in_model_name", "model_name"),
+    [(False, "Mythos 7"), (True, "Mythos 7 (max)")],
+)
+def test_auto_matched_effort_labels_keep_one_row_when_the_label_gains_an_alias(
+    effort_in_model_name, model_name
+):
+    session = _session()
+    release = _add_release(session)
+    board = _board(effort_in_model_name=effort_in_model_name)
+    entries = [
+        _entry("Opus 5.5 (xhigh)", 3.61),
+        _entry("Sol 5.6 (xhigh)", 4.7),
+        _entry("Mythos 7 (max)", 6.0),
+    ]
+    first = LiveLeaderboardSyncService(session, board).sync(entries)
+    assert first.auto_matched == ["Mythos 7 (max) (mini-SWE-agent)"]
+    row = _rows(session)[f"{model_name} (mini-SWE-agent)"]
+
+    session.add(
+        ModelProviderAlias(
+            model_release_id=release.id, provider="test-board", alias="Mythos 7 (max)"
+        )
+    )
+    session.commit()
+    again = LiveLeaderboardSyncService(session, board).sync(entries)
+    assert (again.created, again.renamed) == (0, 0)
+    assert _rows(session)[f"{model_name} (mini-SWE-agent)"] is row
+    assert session.query(Evaluation).filter_by(paper_id=2).count() == 2
+
+
+def test_sync_renames_the_managed_row_of_an_upstream_label():
+    session = _session()
+    _add_release(session)
+    entries = [
+        _entry("Opus 5.5 (xhigh)", 3.61),
+        _entry("Sol 5.6 (xhigh)", 4.7),
+        _entry("Mythos 7 (max)", 6.0),
+    ]
+    LiveLeaderboardSyncService(session, _board()).sync(entries)
+    row = _rows(session)["Mythos 7 (mini-SWE-agent)"]
+    row.model_name = "Mythos 7 (max)"
+    row.methodology += " Reviewer note."
+    session.commit()
+
+    stats = LiveLeaderboardSyncService(session, _board()).sync(entries)
+    assert (stats.created, stats.renamed) == (0, 1)
+    assert row.model_name == "Mythos 7"
+    assert row.methodology.endswith("Test protocol. Reviewer note.")
+    assert stats.missing_upstream == []
 
 
 def test_bare_model_names_reach_the_radar_with_their_family_lab():

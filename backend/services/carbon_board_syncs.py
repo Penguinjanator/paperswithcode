@@ -20,8 +20,10 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
+from backend.services import frontier_rsi_sync_service as frontier_rsi
 from backend.services import jevbench_sync_service as jevbench
 from backend.services import rsi_exam_sync_service as rsi_exam
+from backend.services import rsi_infra_sync_service as rsi_infra
 from backend.services import surge_chartography_sync_service as surge_chartography
 from backend.services import swe_marathon_sync_service as swe_marathon
 from backend.services import vals_finance_agent_sync_service as vals_finance_agent
@@ -742,6 +744,8 @@ BOARD_SYNCS: dict[str, BoardSync] = {
             url=CRITPT_URL,
             task_slug="scientific-reasoning",
             dataset_slug="critpt",
+            effort_in_model_name=True,
+            retire_missing=False,
             metric="Accuracy",
             identities=IDENTITIES["critpt"],
             min_selected=10,
@@ -757,6 +761,8 @@ BOARD_SYNCS: dict[str, BoardSync] = {
             url=CRITPT_V2_URL,
             task_slug="scientific-reasoning",
             dataset_slug="critpt-v2",
+            effort_in_model_name=True,
+            retire_missing=False,
             metric="Accuracy",
             identities=IDENTITIES["critpt-v2"],
             min_selected=10,
@@ -771,6 +777,8 @@ BOARD_SYNCS: dict[str, BoardSync] = {
             url=TERMINAL_BENCH_SCIENCE_URL,
             task_slug="scientific-reasoning",
             dataset_slug="terminal-bench-science-0-1",
+            effort_in_model_name=True,
+            retire_missing=False,
             metric="Accuracy",
             identities=IDENTITIES["terminal-bench-science-0-1"],
             min_selected=10,
@@ -788,4 +796,6 @@ BOARD_SYNCS: dict[str, BoardSync] = {
     "sync_swe_marathon": BoardSync(swe_marathon.BOARD, swe_marathon.fetch_swe_marathon),
     "sync_jevbench": BoardSync(jevbench.BOARD, jevbench.fetch_jevbench),
     "sync_rsi_exam": BoardSync(rsi_exam.BOARD, rsi_exam.fetch_rsi_exam),
+    "sync_frontier_rsi": BoardSync(frontier_rsi.BOARD, frontier_rsi.fetch_frontier_rsi),
+    "sync_rsi_infra": BoardSync(rsi_infra.BOARD, rsi_infra.fetch_rsi_infra),
 }

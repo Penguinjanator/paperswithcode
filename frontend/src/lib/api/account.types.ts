@@ -30,6 +30,10 @@ export interface SavedPapersResponse {
   bucket_connected: boolean;
   /** True once any device has migrated this account to its HF Bucket. */
   bucket_migrated: boolean;
+  /** Why the authorized HF Bucket could not be used, if it failed. */
+  bucket_error?: string | null;
+  /** False for accounts that cannot own a Bucket (Enterprise managed users). */
+  bucket_available?: boolean;
 }
 
 /** Payload accepted by `POST /papers/submit`. Either `arxiv_id` or

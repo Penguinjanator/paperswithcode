@@ -68,6 +68,20 @@ class SavedPapersResponse(BaseModel):
             "only needs to reconnect"
         ),
     )
+    bucket_error: str | None = Field(
+        None,
+        description=(
+            "Why the authorized HF Bucket could not be used; saved papers were "
+            "read from Papers With Code instead"
+        ),
+    )
+    bucket_available: bool = Field(
+        True,
+        description=(
+            "Whether the account can own an HF Bucket; Enterprise managed "
+            "accounts keep saved papers in Papers With Code"
+        ),
+    )
 
 
 def _bucket_error(error: PaperBucketError) -> HTTPException:
@@ -98,6 +112,7 @@ def get_my_bookmark_ids(
         encrypted_credential=request.cookies.get(BUCKET_MANAGE_OAUTH_COOKIE_NAME),
         hf_user_id=user["hf_user_id"],
         username=user["username"],
+        hub_username=user.get("hub_username"),
     )
     return BookmarkIdsResponse(paper_ids=[item.paper_id for item in listing.refs])
 
@@ -123,6 +138,7 @@ def get_my_bookmarks(
         encrypted_credential=request.cookies.get(BUCKET_MANAGE_OAUTH_COOKIE_NAME),
         hf_user_id=user["hf_user_id"],
         username=user["username"],
+        hub_username=user.get("hub_username"),
     )
     areas = [
         SavedAreaGroup(
@@ -145,6 +161,8 @@ def get_my_bookmarks(
         areas=areas,
         bucket_connected=projection.bucket_connected,
         bucket_migrated=projection.bucket_migrated,
+        bucket_error=projection.bucket_error,
+        bucket_available=projection.bucket_available,
     )
 
 
@@ -165,6 +183,7 @@ def add_bookmark(
             encrypted_credential=request.cookies.get(BUCKET_MANAGE_OAUTH_COOKIE_NAME),
             hf_user_id=user["hf_user_id"],
             username=user["username"],
+            hub_username=user.get("hub_username"),
         )
     except BookmarkPaperNotFoundError:
         raise HTTPException(
@@ -191,6 +210,7 @@ def remove_bookmark(
             encrypted_credential=request.cookies.get(BUCKET_MANAGE_OAUTH_COOKIE_NAME),
             hf_user_id=user["hf_user_id"],
             username=user["username"],
+            hub_username=user.get("hub_username"),
         )
     except PaperBucketError as error:
         raise _bucket_error(error) from error

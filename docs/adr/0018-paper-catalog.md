@@ -168,6 +168,18 @@ Saved papers live in the user's Hugging Face Bucket, but the Bucket token is sto
 
 Code: `backend/models/database/identity.py`
 
+## Unmigrated accounts save to the database when their Bucket cannot be set up
+
+Some Hugging Face accounts cannot create or write their private saved-papers Bucket even after approving access (for example a Hub permission or storage refusal). Until an account has migrated, its database bookmarks are already the source that listings read, so save and unsave write the database and succeed instead of failing. The listing returns the Bucket error so /saved explains why the migration did not happen rather than offering the same approval again. Once an account has migrated, Bucket failures still fail the request, so the Bucket and the database mirror cannot diverge. A retried migration copies every database bookmark, including those saved during the fallback.
+
+Code: `backend/services/bookmark_service.py::BookmarkService._require_bucket`
+
+## Enterprise managed accounts keep saved papers in the database
+
+Hugging Face Enterprise managed users (usernames of the form `org:id`) cannot create any content in their personal namespace, so a personal saved-papers Bucket can never exist for them. Creating it in the managing organization instead would expose personal bookmarks to that organization and need org write access. These accounts therefore skip the Bucket: saves write the database without an authorization prompt, and the listing reports bucket_available=false so /saved offers no migration. Hub usernames cannot otherwise contain a colon.
+
+Code: `backend/services/saved_papers_bucket_service.py::namespace_supports_bucket`
+
 ## Spam rejection reports counts from the pre-lock snapshot
 
 reject_active_as_spam takes its 'before' moderation snapshot without a row lock, before the locked catalog mutation runs, to preserve the historical semantics of the count it returns publicly. Moving the snapshot inside the lock would change that public count.

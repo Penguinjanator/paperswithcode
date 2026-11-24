@@ -362,6 +362,9 @@ def test_cron_status_reports_exact_production_release(
     assert status["jobs"]["sync_jevbench"]["timeout"] == "30m"
     assert status["jobs"]["sync_sle"]["timeout"] == "30m"
     assert status["jobs"]["sync_rsi_exam"]["timeout"] == "30m"
+    assert status["jobs"]["sync_frontier_rsi"]["timeout"] == "30m"
+    assert status["jobs"]["sync_rsi_inference"]["timeout"] == "30m"
+    assert status["jobs"]["sync_rsi_infra"]["timeout"] == "30m"
     assert status["jobs"]["sync_frontiercs_2"]["timeout"] == "30m"
     assert status["jobs"]["sync_vals_index"]["timeout"] == "30m"
     assert status["jobs"]["sync_swe_sweep"]["timeout"] == "30m"
@@ -573,6 +576,40 @@ def test_host_layout_grants_cron_traversal_and_drops_production_group(monkeypatc
             "/var/lib/paperswithcode/production",
         ],
         ["gpasswd", "--delete", "pwc-cron", "pwc-production"],
+    ]
+
+
+def test_host_layout_shares_only_the_trace_spool_with_cron(monkeypatch):
+    import deploy.install_host_layout as host_layout
+
+    calls: list[list[str]] = []
+    directories: list[tuple[str, str, str, int]] = []
+    monkeypatch.setattr(
+        host_layout.subprocess, "run", lambda command, check: calls.append(command)
+    )
+    monkeypatch.setattr(
+        host_layout,
+        "ensure_dir",
+        lambda path, user, group, mode: directories.append(
+            (str(path), user, group, mode)
+        ),
+    )
+
+    host_layout.share_curation_trace_spool()
+
+    spool = "/var/lib/paperswithcode/production/recovery-spool"
+    assert directories == [
+        (f"{spool}/curation-traces", "pwc-production", "pwc-production", 0o700)
+    ]
+    assert calls == [
+        ["setfacl", "--modify", "user:pwc-cron:--x", spool],
+        [
+            "setfacl",
+            "--modify",
+            "user:pwc-cron:rwx,default:user:pwc-cron:rw-,"
+            "default:user:pwc-production:rw-",
+            f"{spool}/curation-traces",
+        ],
     ]
 
 

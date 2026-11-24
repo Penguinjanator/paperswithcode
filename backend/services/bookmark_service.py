@@ -19,6 +19,7 @@ from backend.services.paper_service import PaperService
 from backend.services.saved_papers_bucket_service import (
     SavedPaperRef,
     SavedPapersBucket,
+    namespace_supports_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 class BookmarkRefListing:
     refs: tuple[SavedPaperRef, ...]
     bucket_connected: bool
+    bucket_error: str | None = None
+    bucket_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class SavedPapersProjection:
     areas: tuple[SavedAreaProjection, ...]
     bucket_connected: bool
     bucket_migrated: bool
+    bucket_error: str | None = None
+    bucket_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,7 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
+        hub_username: str | None = None,
     ) -> SavedPapersBucket | None:
         credential = (
             decrypt_oauth_credential(
@@ -131,7 +137,9 @@ class BookmarkService:
         if credential is None:
             return None
 
-        store = SavedPapersBucket(token=credential.token, username=username)
+        store = SavedPapersBucket(
+            token=credential.token, username=hub_username or username
+        )
         store.initialize(lambda: self.load_legacy_refs(username))
         return store
 
@@ -165,24 +173,29 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
+        hub_username: str | None = None,
     ) -> BookmarkRefListing:
         legacy = self.load_legacy_refs(username)
+        if not namespace_supports_bucket(hub_username or username):
+            return BookmarkRefListing(tuple(legacy), False, bucket_available=False)
         try:
             store = self.initialize_bucket(
                 encrypted_credential=encrypted_credential,
                 hf_user_id=hf_user_id,
                 username=username,
+                hub_username=hub_username,
             )
             if store is None:
                 return BookmarkRefListing(tuple(legacy), False)
             refs = tuple(store.list())
         except PaperBucketError as error:
             logger.warning(
-                "Falling back to database bookmarks for %s: %s",
+                "Falling back to database bookmarks for %s: %s (%r)",
                 username,
                 error,
+                error.__cause__,
             )
-            return BookmarkRefListing(tuple(legacy), False)
+            return BookmarkRefListing(tuple(legacy), False, str(error))
         self.record_bucket_migration(username)
         return BookmarkRefListing(refs, True)
 
@@ -192,11 +205,13 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
+        hub_username: str | None = None,
     ) -> SavedPapersProjection:
         listing = self.list_refs(
             encrypted_credential=encrypted_credential,
             hf_user_id=hf_user_id,
             username=username,
+            hub_username=hub_username,
         )
         bucket_migrated = listing.bucket_connected or self.bucket_migrated(username)
         paper_ids = [item.paper_id for item in listing.refs]
@@ -206,6 +221,8 @@ class BookmarkService:
                 areas=(),
                 bucket_connected=listing.bucket_connected,
                 bucket_migrated=bucket_migrated,
+                bucket_error=listing.bucket_error,
+                bucket_available=listing.bucket_available,
             )
 
         db_papers = self.db.query(DBPaper).filter(DBPaper.id.in_(paper_ids)).all()
@@ -308,6 +325,8 @@ class BookmarkService:
             ),
             bucket_connected=listing.bucket_connected,
             bucket_migrated=bucket_migrated,
+            bucket_error=listing.bucket_error,
+            bucket_available=listing.bucket_available,
         )
 
     def _require_bucket(
@@ -316,12 +335,28 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
-    ) -> SavedPapersBucket:
-        store = self.initialize_bucket(
-            encrypted_credential=encrypted_credential,
-            hf_user_id=hf_user_id,
-            username=username,
-        )
+        hub_username: str | None = None,
+    ) -> SavedPapersBucket | None:
+        """Return the Bucket, or None while an unmigrated account cannot set one up."""
+        if not namespace_supports_bucket(hub_username or username):
+            return None
+        try:
+            store = self.initialize_bucket(
+                encrypted_credential=encrypted_credential,
+                hf_user_id=hf_user_id,
+                username=username,
+                hub_username=hub_username,
+            )
+        except PaperBucketError as error:
+            if self.bucket_migrated(username):
+                raise
+            logger.warning(
+                "Saving bookmarks for %s in the database: %s (%r)",
+                username,
+                error,
+                error.__cause__,
+            )
+            return None
         if store is None:
             raise PaperBucketError(
                 "Authorize Papers With Code to manage your saved-papers Bucket.",
@@ -336,8 +371,13 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
+        hub_username: str | None = None,
     ) -> None:
-        """Add a Bucket bookmark, then create its database compatibility mirror."""
+        """Add a Bucket bookmark, then create its database compatibility mirror.
+
+        An unmigrated account whose Bucket cannot be set up keeps saving to the
+        database, which stays its bookmark source until a migration succeeds.
+        """
         paper = self.db.query(DBPaper).filter(DBPaper.id == paper_id).first()
         if paper is None:
             raise BookmarkPaperNotFoundError
@@ -346,13 +386,15 @@ class BookmarkService:
             encrypted_credential=encrypted_credential,
             hf_user_id=hf_user_id,
             username=username,
+            hub_username=hub_username,
         )
-        store.add(
-            paper_id,
-            title=paper.title,
-            arxiv_id=paper.arxiv_id,
-            source_url=paper.source_url,
-        )
+        if store is not None:
+            store.add(
+                paper_id,
+                title=paper.title,
+                arxiv_id=paper.arxiv_id,
+                source_url=paper.source_url,
+            )
 
         existing = (
             self.db.query(UserBookmark)
@@ -373,14 +415,17 @@ class BookmarkService:
         encrypted_credential: str | None,
         hf_user_id: str,
         username: str,
+        hub_username: str | None = None,
     ) -> None:
         """Remove a Bucket bookmark, then delete its database compatibility mirror."""
         store = self._require_bucket(
             encrypted_credential=encrypted_credential,
             hf_user_id=hf_user_id,
             username=username,
+            hub_username=hub_username,
         )
-        store.remove(paper_id)
+        if store is not None:
+            store.remove(paper_id)
         self.db.query(UserBookmark).filter(
             UserBookmark.hf_username == username,
             UserBookmark.paper_id == paper_id,

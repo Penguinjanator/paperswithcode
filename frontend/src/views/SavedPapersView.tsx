@@ -32,7 +32,8 @@ const SavedPapersView: React.FC = () => {
   const bucketAuthorizationRequired =
     query.error instanceof ApiError &&
     query.error.code === "saved_papers_bucket_authorization_required";
-  const showBucketMigration = !!query.data && !query.data.bucket_connected;
+  const showBucketMigration =
+    !!query.data && !query.data.bucket_connected && query.data.bucket_available !== false;
 
   const authorizeBucket = () => {
     window.location.assign(savedPapersAuthorizationUrl());
@@ -123,6 +124,18 @@ const SavedPapersView: React.FC = () => {
           </p>
           <button type="button" className="hf-signin-btn" onClick={authorizeBucket}>
             Reconnect Hugging Face Bucket
+          </button>
+        </div>
+      ) : showBucketMigration && query.data.bucket_error ? (
+        <div className="saved-bucket-migration">
+          <p>
+            Hugging Face could not set up your private saved-papers Bucket:{" "}
+            {query.data.bucket_error} Your saved papers stay in Papers With Code,
+            and saving new papers still works. Check that your Hugging Face
+            account can create private Buckets, then try again.
+          </p>
+          <button type="button" className="hf-signin-btn" onClick={authorizeBucket}>
+            Try the Bucket migration again
           </button>
         </div>
       ) : showBucketMigration ? (

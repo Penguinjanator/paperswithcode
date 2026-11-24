@@ -487,6 +487,7 @@ def test_existing_mirror_still_updates_bucket_without_committing(monkeypatch):
 
 def test_bucket_mutation_failure_prevents_database_mirror_change(monkeypatch):
     db = MutationDb()
+    monkeypatch.setattr(BookmarkService, "bucket_migrated", lambda *_args: True)
 
     class FailingStore(FakeBucketStore):
         def add(self, paper_id, **metadata):
@@ -581,3 +582,114 @@ def test_disconnected_listing_reports_account_bucket_migration(
 
     assert result.bucket_connected is False
     assert result.bucket_migrated is expected
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_bucket_setup_failure_saves_to_database_until_migrated(monkeypatch, migrated):
+    db = MutationDb()
+
+    def failing_setup(*_args, **_kwargs):
+        raise PaperBucketError("Hugging Face could not write the saved-papers Bucket.")
+
+    monkeypatch.setattr(BookmarkService, "initialize_bucket", failing_setup)
+    monkeypatch.setattr(BookmarkService, "bucket_migrated", lambda *_args: migrated)
+    user = {"username": "alice", "hf_user_id": "hf-alice"}
+
+    if migrated:
+        with pytest.raises(HTTPException) as add_error:
+            bookmarks.add_bookmark(_request(), 42, user, db)
+        assert add_error.value.status_code == 400
+        assert db.added == []
+        assert db.commits == 0
+        return
+
+    bookmarks.add_bookmark(_request(), 42, user, db)
+    assert [item.paper_id for item in db.added] == [42]
+    assert db.commits == 1
+
+    bookmarks.remove_bookmark(_request(), 42, user, db)
+    assert db.bookmark_query.deleted is True
+    assert db.commits == 2
+
+
+def test_bucket_setup_failure_is_reported_on_the_listing(monkeypatch):
+    db = LegacyBookmarkDb([(42, datetime.now(UTC), "Legacy paper", None, None)])
+
+    def failing_setup(*_args, **_kwargs):
+        raise PaperBucketError("Hugging Face could not write the saved-papers Bucket.")
+
+    monkeypatch.setattr(BookmarkService, "initialize_bucket", failing_setup)
+
+    listing = BookmarkService(db).list_refs(
+        encrypted_credential="encrypted",
+        hf_user_id="hf-alice",
+        username="alice",
+    )
+
+    assert [item.paper_id for item in listing.refs] == [42]
+    assert listing.bucket_connected is False
+    assert listing.bucket_error == (
+        "Hugging Face could not write the saved-papers Bucket."
+    )
+
+
+def test_bucket_uses_the_hub_username_casing(monkeypatch):
+    namespaces = []
+
+    class RecordingBucket:
+        def __init__(self, *, token, username):
+            namespaces.append(username)
+
+        def initialize(self, _load_legacy):
+            pass
+
+        def list(self):
+            return []
+
+    monkeypatch.setattr(
+        bookmark_service,
+        "decrypt_oauth_credential",
+        lambda *_args: SimpleNamespace(token="bucket-token"),
+    )
+    monkeypatch.setattr(bookmark_service, "SavedPapersBucket", RecordingBucket)
+    monkeypatch.setattr(BookmarkService, "record_bucket_migration", lambda *_args: None)
+    db = LegacyBookmarkDb([])
+
+    BookmarkService(db).list_refs(
+        encrypted_credential="encrypted",
+        hf_user_id="hf-andrex",
+        username="andrex14",
+        hub_username="Andrex14",
+    )
+
+    assert namespaces == ["Andrex14"]
+
+
+def test_managed_accounts_keep_saved_papers_in_the_database(monkeypatch):
+    monkeypatch.setattr(
+        BookmarkService,
+        "initialize_bucket",
+        lambda *_args, **_kwargs: pytest.fail("managed accounts cannot own a Bucket"),
+    )
+    user = {
+        "username": "entrust-org:00uol46ez0ybnco9l417",
+        "hub_username": "entrust-org:00uol46ez0YBncO9l417",
+        "hf_user_id": "hf-managed",
+    }
+    db = MutationDb()
+
+    bookmarks.add_bookmark(_request(), 42, user, db)
+    assert [item.paper_id for item in db.added] == [42]
+
+    bookmarks.remove_bookmark(_request(), 42, user, db)
+    assert db.bookmark_query.deleted is True
+
+    listing = BookmarkService(LegacyBookmarkDb([])).list_refs(
+        encrypted_credential="encrypted",
+        hf_user_id=user["hf_user_id"],
+        username=user["username"],
+        hub_username=user["hub_username"],
+    )
+    assert listing.bucket_connected is False
+    assert listing.bucket_available is False
+    assert listing.bucket_error is None
