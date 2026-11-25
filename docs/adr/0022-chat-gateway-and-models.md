@@ -70,9 +70,9 @@ After a live chat stream ends, the registry keeps it for 30 seconds before remov
 
 Code: `backend/services/chat_live_stream_service.py::LiveChatStreamRegistry._expire`
 
-## GLM-5.3-Flash is hidden from production discovery while direct Luna serves
+## GLM-5.3-Flash is retired from discovery
 
-When direct OpenAI Luna serves production, production model discovery exposes only Luna; GLM-5.3-Flash is hidden and its sessions continue on Luna.
+Production with direct OpenAI Luna exposes only Luna plus the optional sponsored DeepSeek; without direct Luna, production discovers DeepSeek V4 Flash like the other environments. GLM-5.3-Flash is no longer a discovery record in any environment. Sessions that selected it resolve to the environment's default model through `DEFAULT_FALLBACK_MODEL_IDS`, and its route stays in the retired-route tables so persisted capabilities still resolve (issue #1115).
 
 Code: `backend/services/runtime_policies/chat_provider.py::validate_chat_provider_policy`
 
@@ -162,11 +162,17 @@ Each user's monthly usage row snapshots the budget limit when created. Changing 
 
 Code: `backend/services/openrouter_user_budget_service.py::OpenRouterUserBudgetService.reserve_call`
 
-## Only tool outputs and validated catalog results seed fetchable URLs
+## WebFetch is removed; web search covers discovery
 
-URLs the model may fetch are seeded from Bash/Read/Grep output and the validated search_papers catalog projection. WebFetch and web-search result blocks are excluded so fetched pages cannot widen the fetch allowlist.
+Chat has no WebFetch tool. The gateway `/web-fetch` route, the broker's fetch grants and proxy token, and the worker's URL allowlist are gone; both harnesses keep the native WebFetch tool disallowed, and `search_web` covers live-web discovery (issue #1118). The run frame still carries the validated `fetchable_urls` seed so workers and backends from adjacent releases keep one turn protocol.
 
-Code: `backend/services/chat_session_service.py::ChatSessionService.fetchable_url_seed`
+Code: `backend/chat_sandbox_worker/tool_policy.py::ToolBudget.authorize`
+
+## Every tool call registers its round before authorization
+
+`ToolBudget.authorize` raises on a tool ID that was not registered through `register_call` or `register_round`, so a caller that skips the assistant-message boundary fails instead of counting each call as its own round.
+
+Code: `backend/chat_sandbox_worker/tool_policy.py::ToolBudget.authorize`
 
 ## OpenAI context and long-context thresholds come from the GPT-6 Luna model page
 

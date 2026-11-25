@@ -120,6 +120,26 @@ class TopicBubble(BaseModel):
     top_paper: FeaturedTopicPaper | None = None
 
 
+class PopularFollow(BaseModel):
+    """One of the most followed tasks or methods, as a homepage card."""
+
+    kind: Literal["task", "method"]
+    entity_id: int
+    name: str
+    url: str
+    followers: int
+    week_papers: int
+    follower_avatars: list[TopicPerson] = Field(default_factory=list)
+    top_paper: FeaturedTopicPaper | None = None
+
+
+class EntityFollowers(BaseModel):
+    """How many accounts follow a task, method, benchmark, author, or organization, and a few who show it."""
+
+    followers: int
+    follower_avatars: list[TopicPerson] = Field(default_factory=list)
+
+
 class FollowerVisibilityUpdate(BaseModel):
     show_as_follower: bool
 

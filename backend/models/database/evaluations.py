@@ -140,9 +140,6 @@ class Evaluation(Base):
     best_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     best_metric: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     evaluated_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    external_source_url: Mapped[Optional[str]] = mapped_column(
-        String(500), nullable=True
-    )
     source_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     external: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false"), default=False
@@ -169,6 +166,10 @@ class Evaluation(Base):
         Index("idx_evaluations_external", "external"),
         Index("idx_evaluations_source_url", "source_url"),
     )
+
+    @property
+    def external_source_url(self) -> Optional[str]:
+        return self.source_url
 
     def __repr__(self) -> str:
         return f"<Evaluation(id={self.id}, paper_id={self.paper_id}, task_id={self.task_id}, dataset_id={self.dataset_id})>"

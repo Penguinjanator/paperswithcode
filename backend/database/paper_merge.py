@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from sqlalchemy import func, or_, text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from backend.models.database import (
@@ -76,20 +76,9 @@ def _repoint_evaluation_sources(
     )
     pattern = f"%{external_id}%"
     repointed = 0
-    for evaluation in db.query(Evaluation).filter(
-        or_(
-            Evaluation.source_url.like(pattern),
-            Evaluation.external_source_url.like(pattern),
-        )
-    ):
-        changed = False
+    for evaluation in db.query(Evaluation).filter(Evaluation.source_url.like(pattern)):
         if _normalize_url_for_match(evaluation.source_url) in old_keys:
             evaluation.source_url = new_url
-            changed = True
-        if _normalize_url_for_match(evaluation.external_source_url) in old_keys:
-            evaluation.external_source_url = new_url
-            changed = True
-        if changed:
             evaluation.external = evaluation.paper_id != arxiv_paper.id
             repointed += 1
     return repointed
@@ -426,7 +415,7 @@ def merge_external_paper_into_arxiv(
         "bookmarks_dropped": 0,
     }
 
-    external_source_url = external.source_url
+    merged_source_url = external.source_url
     affected_leaderboards: set[tuple[int, int, str | None]] = set()
 
     for evaluation in (
@@ -451,8 +440,8 @@ def merge_external_paper_into_arxiv(
             stats["evaluations_dropped"] += 1
         else:
             evaluation.paper_id = arxiv_paper_id
-            if external_source_url and not evaluation.external_source_url:
-                evaluation.external_source_url = external_source_url
+            if merged_source_url and not evaluation.source_url:
+                evaluation.source_url = merged_source_url
             stats["evaluations_moved"] += 1
             affected_leaderboards.add(
                 (evaluation.task_id, evaluation.dataset_id, evaluation.best_metric)

@@ -11,6 +11,7 @@ import { useOptionalAuth } from '@/lib/authContext';
 function invalidateResearch(client: QueryClient, subject: string | undefined, { follows }: { follows: boolean }) {
   return Promise.all([
     follows && client.invalidateQueries({ queryKey: researchQueries.follows(subject).queryKey }),
+    follows && client.invalidateQueries({ queryKey: researchKeys.entityFollowers }),
     client.invalidateQueries({ queryKey: paperFeedKeys.following(subject) }),
     // Following something turns the weekly email on by default.
     client.invalidateQueries({ queryKey: researchQueries.email(subject).queryKey }),
@@ -141,8 +142,8 @@ export function useFollowTopics() {
   });
 }
 
-/** How many of the most followed topics the homepage shows as cards above the feed. */
-export const FEATURED_TOPIC_COUNT = 10;
+/** How many of the most followed topics the homepage shows as cards above the feed, beside as many tasks and methods. */
+export const FEATURED_TOPIC_COUNT = 4;
 
 /** Follows one popular topic from the homepage and opens Following filtered to it.
  * Guests sign in first; Following saves the stashed pick after sign-in. */

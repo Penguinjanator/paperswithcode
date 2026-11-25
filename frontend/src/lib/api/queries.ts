@@ -10,9 +10,9 @@ import { operationsApi } from "@/lib/api/operations";
 import { paperEditsApi } from "@/lib/api/paperEdits";
 import { getPaperLayout, getPaperWebMarkdown, getPaperWebPage, papersApi } from "@/lib/api/papers";
 import { profilesApi } from "@/lib/api/profiles";
-import { researchApi } from "@/lib/api/research";
+import { researchApi, type FollowKind } from "@/lib/api/research";
 import { statsApi } from "@/lib/api/stats";
-import { readFeaturedTopics, writeFeaturedTopics } from "@/lib/featuredTopicsCache";
+import { readFeaturedTopics, readPopularFollows, writeFeaturedTopics, writePopularFollows } from "@/lib/featuredTopicsCache";
 
 /**
  * The one place that names React Query cache entries.
@@ -117,6 +117,11 @@ export const catalogQueries = {
   taskPage: (slug: string | undefined, params: Params<typeof catalogApi.taskPage, 1>) => queryOptions({
     queryKey: ["task-page", slug, params],
     queryFn: when(slug, (taskSlug) => catalogApi.taskPage(taskSlug, params)),
+    staleTime: TEN_MINUTES,
+  }),
+  taskReadingPath: (idOrSlug: string | undefined) => queryOptions({
+    queryKey: ["task-reading-path", idOrSlug],
+    queryFn: when(idOrSlug, (id) => catalogApi.taskReadingPath(id)),
     staleTime: TEN_MINUTES,
   }),
   taskBenchmarkTrends: (
@@ -361,6 +366,10 @@ export const researchQueries = {
     queryKey: ["research-topics", subject],
     queryFn: researchApi.topics,
   }),
+  entityFollowers: (kind: FollowKind, id: string | number) => queryOptions({
+    queryKey: [...researchKeys.entityFollowers, kind, String(id)],
+    queryFn: () => researchApi.entityFollowers(kind, id),
+  }),
   publicTopic: (id: number, subject: string | undefined) => queryOptions({
     queryKey: ["research-public-topic", id, subject],
     queryFn: () => researchApi.publicTopic(id),
@@ -381,6 +390,17 @@ export const researchQueries = {
     // Last visit's topics paint at once; a stale copy refetches in the background.
     initialData: () => readFeaturedTopics()?.topics,
     initialDataUpdatedAt: () => readFeaturedTopics()?.at,
+  }),
+  popularFollows: () => queryOptions({
+    queryKey: ["research-popular-follows"],
+    queryFn: async () => {
+      const follows = await researchApi.popularFollows();
+      writePopularFollows(follows);
+      return follows;
+    },
+    staleTime: TEN_MINUTES,
+    initialData: () => readPopularFollows()?.follows,
+    initialDataUpdatedAt: () => readPopularFollows()?.at,
   }),
   topicMatches: (text: string) => queryOptions({
     queryKey: ["research-topic-matches", text],
@@ -404,6 +424,8 @@ export const statsQueries = {
 export const researchKeys = {
   /** Prefix of every public topic entry. */
   publicTopics: ["research-public-topic"] as const,
+  /** Prefix of every task, method, benchmark, author and organization follower count. */
+  entityFollowers: ["research-entity-followers"] as const,
   // The topic id leads the key: paper feeds keep placeholder data only within one key[0],
   // so another topic never shows this one's papers while loading.
   topicPapers: (id: number, order: string, range: { startDate?: string; endDate?: string }, subject: string | undefined) =>

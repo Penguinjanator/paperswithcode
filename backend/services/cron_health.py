@@ -415,6 +415,19 @@ def _persistent_execution_paths(settings: Any) -> tuple[Path, Path] | None:
     )
 
 
+def _launcher_paths(settings: Any) -> tuple[Path, ...]:
+    if settings.environment not in {"production", "staging"}:
+        return ()
+    directories = [Path(settings.cron_log_dir)]
+    if settings.environment == "production":
+        directories += [
+            Path(job.log_directory) for job in list_cron_jobs() if job.log_directory
+        ]
+    return tuple(
+        dict.fromkeys(directory / "launcher.jsonl" for directory in directories)
+    )
+
+
 def fetch_persistent_execution(
     job: CronJobDefinition,
     log_status: Dict[str, Any],
@@ -425,10 +438,13 @@ def fetch_persistent_execution(
     """Pair an exact-release launcher start with a terminal file-log result."""
 
     if launcher_path is None or manifest_path is None:
-        paths = _persistent_execution_paths(get_settings())
+        settings = get_settings()
+        paths = _persistent_execution_paths(settings)
         if paths is None:
             return None
         launcher_path, manifest_path = paths
+        if job.log_directory and settings.environment == "production":
+            launcher_path = Path(job.log_directory) / "launcher.jsonl"
 
     try:
         manifest_raw = manifest_path.read_bytes()
@@ -505,30 +521,33 @@ def fetch_launcher_history(
     success, looks fine without this history.
     """
 
-    if launcher_path is None:
-        paths = _persistent_execution_paths(get_settings())
-        if paths is None:
-            return {}
-        launcher_path = paths[0]
-    raw = _read_launcher_tail(launcher_path, MAX_LAUNCHER_HISTORY_BYTES)
-    if raw is None:
-        return {}
+    paths = (
+        _launcher_paths(get_settings()) if launcher_path is None else (launcher_path,)
+    )
     cutoff = (now or _utcnow()) - timedelta(hours=LAUNCHER_HISTORY_HOURS)
+    records: list[tuple[datetime, int, Dict[str, Any]]] = []
+    for path in paths:
+        raw = _read_launcher_tail(path, MAX_LAUNCHER_HISTORY_BYTES)
+        if raw is None:
+            continue
+        for raw_line in raw.splitlines():
+            try:
+                record = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("event") not in {
+                "exit",
+                "lock_skipped",
+            }:
+                continue
+            finished = _parse_log_timestamp(record.get("at"))
+            if finished is None or finished < cutoff:
+                continue
+            records.append((finished, len(records), record))
+    records.sort(key=lambda item: item[:2], reverse=True)
     history: Dict[str, Dict[str, Any]] = {}
     streak_closed: set[str] = set()
-    for raw_line in reversed(raw.splitlines()):
-        try:
-            record = json.loads(raw_line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(record, dict) or record.get("event") not in {
-            "exit",
-            "lock_skipped",
-        }:
-            continue
-        finished = _parse_log_timestamp(record.get("at"))
-        if finished is None or finished < cutoff:
-            continue
+    for finished, _, record in records:
         job_id = str(record.get("job") or record.get("health_job") or "")
         summary = history.setdefault(
             job_id,
@@ -697,6 +716,8 @@ def _sanitized_job_error(value: object, job_id: str) -> str:
         return f"{job_id} upstream provider rate limiting"
     if "endpoint" in lowered:
         return f"{job_id} endpoint configuration or request failure{variable}"
+    if "not readable by the backend" in lowered:
+        return f"{job_id} log directory is not readable by the backend"
     return f"{job_id} latest run failed"
 
 
@@ -2945,7 +2966,18 @@ def build_cron_dashboard(
     def get_recent_log_status(job: CronJobDefinition) -> Dict[str, Any]:
         max_days = max(0, min(14, job.stale_after_minutes // (24 * 60) + 1))
         log_directory = Path(job.log_directory) if job.log_directory else None
-        latest_status = get_cron_job_status(job.log_name, today, logs_dir=log_directory)
+        try:
+            latest_status = get_cron_job_status(
+                job.log_name, today, logs_dir=log_directory
+            )
+        except PermissionError:
+            return {
+                "job_name": job.log_name,
+                "exists": False,
+                "status": "failed",
+                "error": "log directory is not readable by the backend",
+                "work_metrics": {},
+            }
         if latest_status.get("exists") or max_days == 0:
             return latest_status
 
@@ -3018,7 +3050,11 @@ def build_cron_dashboard(
     ]
 
     what_to_check_next = next(
-        (job["diagnostics"] for job in jobs if job["diagnostics"]),
+        (
+            job["diagnostics"]
+            for job in sorted(jobs, key=lambda job: -_OUTPUT_RANK.get(job["status"], 0))
+            if job["diagnostics"]
+        ),
         "All monitored jobs look healthy",
     )
 

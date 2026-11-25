@@ -331,9 +331,10 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         schedule="*/15 * * * * (every 15 minutes)",
         script_path="hourly/update_hot_github_trending.py",
         log_name="update_hot_github_trending",
+        log_directory="/var/lib/paperswithcode/production/repair-cron-logs",
         process_patterns=("update_hot_github_trending",),
         lock_file=(
-            "/var/lib/paperswithcode/production/cron-locks/"
+            "/var/lib/paperswithcode/production/repair-cron-locks/"
             "update_hot_github_trending.lock"
         ),
         expected_runtime_minutes=12,
@@ -670,7 +671,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug = '3d-arena-iso3d-living'
               AND e.best_metric = 'Elo (live, external)'
-              AND e.external_source_url =
+              AND e.source_url =
                   'https://huggingface.co/spaces/3d-arena/3d-arena'
         """,
         workflow_file="cron-sync-3d-arena.yml",
@@ -716,7 +717,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
               AND e.methodology LIKE
                   'Managed by the Papers with Code TabArena live sync.%'
               AND e.best_metric = 'Elo'
-              AND e.external_source_url =
+              AND e.source_url =
                   'https://huggingface.co/spaces/TabArena/leaderboard'
         """,
         workflow_file="cron-sync-tabarena.yml",
@@ -753,7 +754,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug = 'open-asr-leaderboard'
               AND e.best_metric = 'WER'
-              AND e.external_source_url =
+              AND e.source_url =
                   'https://huggingface.co/spaces/hf-audio/open_asr_leaderboard'
               AND e.methodology LIKE
                   'Managed by the Papers with Code Open ASR live sync.%'
@@ -796,7 +797,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                 'open-tts-leaderboard-all-languages'
             )
               AND e.best_metric = 'WER'
-              AND e.external_source_url =
+              AND e.source_url =
                   'https://huggingface.co/spaces/hf-audio/open_tts_leaderboard'
               AND e.methodology LIKE
                   'Managed by the Papers with Code Open TTS live sync.%'
@@ -954,7 +955,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug = 'deepswe'
               AND e.best_metric = 'Pass@1'
-              AND e.external_source_url = 'https://deepswe.datacurve.ai/'
+              AND e.source_url = 'https://deepswe.datacurve.ai/'
               AND e.methodology LIKE
                   'Managed by the Papers with Code DeepSWE live sync.%'
         """,
@@ -999,7 +1000,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                 AND (
                     (
                       e.best_metric = 'Score'
-                      AND e.external_source_url LIKE
+                      AND e.source_url LIKE
                           'https://artificialanalysis.ai/models/%'
                       AND e.methodology LIKE
                           'Managed by the Papers with Code Artificial Analysis live sync.%'
@@ -1007,7 +1008,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
                     OR
                     (
                       e.best_metric = 'Quality Elo'
-                      AND e.external_source_url LIKE
+                      AND e.source_url LIKE
                           'https://artificialanalysis.ai/text-to-speech/models/%'
                       AND e.methodology LIKE
                           'Managed by the Papers with Code Artificial Analysis TTS live sync.%'
@@ -1093,7 +1094,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug = 'programbench'
               AND e.best_metric = 'Resolved'
-              AND e.external_source_url LIKE 'https://programbench.com/run/%'
+              AND e.source_url LIKE 'https://programbench.com/run/%'
               AND e.methodology LIKE
                   'Managed by the Papers with Code ProgramBench live sync.%'
         """,
@@ -2114,7 +2115,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug IN ('frontiercode-main', 'frontiercode-extended')
               AND e.best_metric = 'Score'
-              AND e.external_source_url = 'https://cognition.com/frontiercode'
+              AND e.source_url = 'https://cognition.com/frontiercode'
               AND e.methodology LIKE
                   'Managed by the Papers with Code FrontierCode live sync.%'
         """,
@@ -2152,7 +2153,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
             JOIN datasets d ON d.id = e.dataset_id
             WHERE d.slug = 'coarena'
               AND e.best_metric = 'Elo (live, external)'
-              AND e.external_source_url = 'https://coarena.ai/leaderboard'
+              AND e.source_url = 'https://coarena.ai/leaderboard'
               AND e.methodology LIKE
                   'Managed by the Papers with Code CoArena live sync.%'
         """,
@@ -2461,9 +2462,10 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         schedule="20 5 * * 3 (Wed 05:20 UTC)",
         script_path="backend/scripts/link_google_scholar_profiles.py",
         log_name="link_google_scholar_profiles",
+        log_directory="/var/lib/paperswithcode/production/repair-cron-logs",
         process_patterns=("backend.scripts.link_google_scholar_profiles",),
         lock_file=(
-            "/var/lib/paperswithcode/production/cron-locks/"
+            "/var/lib/paperswithcode/production/repair-cron-locks/"
             "link_google_scholar_profiles.lock"
         ),
         expected_runtime_minutes=60,
@@ -2471,7 +2473,9 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         critical=False,
         healthy_no_work_allowed=True,
         db_freshness_query="""
-            SELECT count(*) AS candidates,
+            SELECT greatest(max(s2_checked_at), max(serpapi_checked_at))
+                       AS last_write,
+                   count(*) AS candidates,
                    count(*) FILTER (WHERE serpapi_evidence IS NOT NULL)
                      AS profiles_read,
                    (SELECT count(*) FROM author_google_scholar_profiles)
@@ -2551,9 +2555,11 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         schedule="35 * * * * (hourly)",
         script_path="backend/scripts/refresh_x_post_likes.py",
         log_name="refresh_x_post_likes",
+        log_directory="/var/lib/paperswithcode/production/repair-cron-logs",
         process_patterns=("backend.scripts.refresh_x_post_likes",),
         lock_file=(
-            "/var/lib/paperswithcode/production/cron-locks/refresh_x_post_likes.lock"
+            "/var/lib/paperswithcode/production/repair-cron-locks/"
+            "refresh_x_post_likes.lock"
         ),
         expected_runtime_minutes=3,
         stale_after_minutes=180,
@@ -2657,7 +2663,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         systemd_timer="pwc-cron-backfill-research-topics.timer",
         systemd_service="pwc-cron-backfill-research-topics.service",
         systemd_extra_units=(),
-        output_evaluator="generic",
+        output_evaluator="research_topics",
         display_name="Backfill Research Topics",
         category="systemd",
         schedule="every minute (systemd)",
@@ -2672,7 +2678,21 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         stale_after_minutes=60,
         critical=False,
         healthy_no_work_allowed=True,
-        db_freshness_query=None,
+        db_freshness_query="""
+            SELECT greatest(max(backfill_finished_at), max(backfill_claimed_at))
+                       AS last_write,
+                   (SELECT extract(epoch FROM now() - min(t.created_at)) / 60
+                    FROM research_topics t
+                    WHERE t.backfill_status IN ('pending', 'running')
+                      AND t.id IN (SELECT topic_id FROM research_topic_follows))
+                       AS oldest_pending_backfill_minutes,
+                   count(*) FILTER (
+                     WHERE backfill_status = 'failed'
+                       AND id IN (SELECT topic_id FROM research_topic_follows)
+                   ) AS failed_backfills
+            FROM research_topics
+        """,
+        db_freshness_reports_writes=False,
         workflow_freshness_required=False,
     ),
     CronJobDefinition(
@@ -2683,7 +2703,7 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         systemd_timer="pwc-cron-rescan-abstract-mentions.timer",
         systemd_service="pwc-cron-rescan-abstract-mentions.service",
         systemd_extra_units=(),
-        output_evaluator="generic",
+        output_evaluator="report_only",
         display_name="Rescan Abstract Mentions",
         category="daily",
         schedule="21 3 * * * (daily)",
@@ -2947,8 +2967,12 @@ CRON_JOBS: Tuple[CronJobDefinition, ...] = (
         schedule="15 * * * * (hourly)",
         script_path="hourly/refresh_paper_embeddings.py",
         log_name="refresh_paper_embeddings",
+        log_directory="/var/lib/paperswithcode/production/repair-cron-logs",
         process_patterns=("refresh_paper_embeddings",),
-        lock_file="/var/lib/paperswithcode/production/cron-locks/refresh_paper_embeddings.lock",
+        lock_file=(
+            "/var/lib/paperswithcode/production/repair-cron-locks/"
+            "refresh_paper_embeddings.lock"
+        ),
         expected_runtime_minutes=20,
         stale_after_minutes=120,
         failure_alert_after=3,

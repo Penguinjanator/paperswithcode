@@ -405,9 +405,7 @@ class EvaluationService:
         paper_ids = {row.paper_id for row in db_evaluations}
         source_paper_ids = set()
         for row in db_evaluations:
-            paper_ref = _PAPER_REF.match(
-                (row.source_url or row.external_source_url or "").strip()
-            )
+            paper_ref = _PAPER_REF.match((row.source_url or "").strip())
             if paper_ref:
                 source_paper_ids.add(int(paper_ref.group(1)))
 
@@ -475,9 +473,7 @@ class EvaluationService:
         related_keys: set[str],
     ) -> Evaluation:
         paper_arxiv_id = paper.arxiv_id if paper else None
-        stored_source_url = (
-            db_evaluation.source_url or db_evaluation.external_source_url
-        )
+        stored_source_url = db_evaluation.source_url
         public_source_url = evaluation_public_source_url(stored_source_url, self.db)
         result_url = evaluation_result_url(
             stored_source_url,
@@ -1074,7 +1070,6 @@ class EvaluationService:
                 best_rank=best_rank,
                 best_metric=best_metric,
                 evaluated_on=evaluated_on,
-                external_source_url=canonical_source_url,
                 source_url=canonical_source_url,
                 external=derived_external,
                 num_parameters=num_parameters,
@@ -1267,7 +1262,6 @@ class EvaluationService:
                     source_url if source_url_set else external_source_url
                 )
                 db_evaluation.source_url = canonical_source_url
-                db_evaluation.external_source_url = canonical_source_url
                 db_evaluation.external = self._derive_external(
                     db_evaluation.paper_id, canonical_source_url
                 )
@@ -1395,7 +1389,6 @@ class EvaluationService:
                 "best_rank",
                 "best_metric",
                 "evaluated_on",
-                "external_source_url",
                 "source_url",
                 "external",
                 "num_parameters",
@@ -1404,6 +1397,9 @@ class EvaluationService:
                 "updated_at",
             )
         }
+        values["source_url"] = values["source_url"] or snapshot.get(
+            "external_source_url"
+        )
         if isinstance(values["evaluated_on"], str):
             from datetime import date
 

@@ -42,9 +42,11 @@ uv run --env-file backend/keys.env python backend/database/migrations/run_<name>
 | `add_model_release_signals.sql` | `model_release_signals` plus `paper_curation_jobs.release_signal_id` and the `model-release-radar` trigger, so `scan_model_releases` can queue a `resolve-model-paper` job per unindexed release; apply as `postgres` (adds the job column to `staging` too) before deploying |
 | `add_paper_suggested_questions.sql` | `paper_suggested_questions`: three cached Luna starter questions per paper, generated lazily by `GET /papers/{id}/suggested-questions` (staging gets INSERT too); apply as `postgres` before deploying |
 | `add_single_benchmark_board_guard.sql` | Deferred `evaluations_single_benchmark_board` trigger: a benchmark's leaderboard for a metric lives on one task, so a row that would leave a copy under a second task is rejected at commit (whole-board moves in one transaction still pass; the migration refuses to install while splits remain); `benchmark_task_board_exceptions` lists approved same-metric boards with a different protocol; apply as `postgres` |
+| `add_paper_document_type.sql` | Optional `papers.document_type` (for example `Technical Report`) used in paper-page search titles and editable by admins, backfilled from the former `DOCUMENT_TYPE_OVERRIDES` map; apply as `postgres` before deploying code that maps the column |
 | `add_method_trend_start_date.sql` | Optional `methods.trend_start_date`: first month of the method usage trend and reference backfill, overriding the source-paper date and `introduced_year` (set to 2015 for `continuous-language-model`); apply before deploying code that maps the column |
 | `add_paper_abstract_mentions.sql` | `abstract_linking` mode and `aliases` on `methods`/`datasets`/`frameworks`, plus `paper_abstract_mentions` for linked catalog names in abstracts (staging gets SELECT); apply as `postgres` before deploying code that maps the columns |
 | `add_research_topics.sql` | `research_topics` (shared free-text topics with backfill state), `research_topic_verdicts` (raw Jev scores per topic and paper), and `research_subscriptions.topic_id`/`topic_set_at`, with staging copies; apply as `postgres` before deploying code that maps the columns |
+| `add_cron_repair_role.sql` | `pwc_cron_repair`: the application role's `public` table privileges minus taxonomy writes, SELECT-only on views, no staging access, for source-repairable CRON jobs (ADR 0020); creates the role without a password (`deploy/configure_db_roles.py` sets it from `/etc/paperswithcode/repair-cron.env`); apply as `postgres` before deploying, and rerun after adding a table a repairable job writes |
 | `add_x_post_requests.sql` | `x_post_requests`: admin "Tweet it" requests that the X agent posts next, in click order (staging gets SELECT, so the button reads but cannot queue there); apply as `postgres` before deploying |
 | `add_research_topic_follows.sql` | `research_topic_follows`: the free-text topics each account follows (several per account), copied from `research_subscriptions.topic_id`, with a staging copy; apply once as `postgres` before deploying code that reads the table; after the deploy, reconcile by hand any `research_subscriptions.topic_set_at` newer than the run |
 | `add_public_research_topics.sql` | `research_topics.created_by_hf_subject`/`is_public`/`hidden_at` and `research_subscriptions.show_as_follower` in `public` and `staging`; rows existing at first run start private / hidden, later rows default public; apply once as `postgres` before deploying code that reads the columns |
@@ -52,6 +54,7 @@ uv run --env-file backend/keys.env python backend/database/migrations/run_<name>
 | `add_author_google_scholar_profiles.sql` | `author_google_scholar_profiles`: verified Google Scholar profile per author with its paper-overlap evidence, shown on author pages and filled by the weekly `link_google_scholar_profiles` CRON (staging gets SELECT); apply as `postgres` before deploying code that reads the table |
 | `repair_staging_twin_tables.sql` | Gives staging copies made with `LIKE … INCLUDING ALL` their own sequences (staging `pending_paper_edits` inserts hit `public`'s sequence and failed) and adds `public` columns later migrations never copied to staging; `deploy/audit_staging_db.py` now fails on either drift. Apply as `postgres`; idempotent |
 | `add_author_google_scholar_candidates.sql` | `author_google_scholar_candidates`: Semantic Scholar and Scholar-profile evidence per Wikidata candidate, the progress of the weekly `link_google_scholar_profiles` CRON; apply as `postgres` before deploying |
+| `add_task_reading_paths.sql` | `task_reading_path_papers`: hand-curated "Start here" papers per task step (`overview`, `foundations`, `recent`) for `GET /tasks/{id}/reading-path`, seeded for object detection, language modeling and image classification; add more paths with plain SQL rows (no deploy; cached up to 10 minutes). Staging gets SELECT; apply as `postgres` before deploying |
 | `add_user_bookmarks.sql` + `run_add_user_bookmarks.py` | user bookmarks |
 | `add_chat_sessions.sql` | Authenticated chat sessions, UI messages, and opaque Agent SDK transcript storage |
 | `add_chat_primary_paper.sql` | Common chat-session primary-paper binding plus durable reader-context snapshots; apply to each enabled environment before activating code that uses the shared chat ORM |
@@ -138,6 +141,12 @@ compatible after the column is dropped.
 Do not run `remove_tasks_is_visible.sql` until visibility-free source is live
 in both the production current and immediate rollback releases. The additive
 entity-search schema and bounded backfill can be applied before that gate.
+
+Staging reads the production database, so every drop waits for staging too.
+Apply a column or table drop only after the release that stops reading it is
+live in production and staging (`pwc-status`; `git merge-base --is-ancestor
+<release sha> <live sha>` for each). If the post-deploy staging sync failed,
+staging still runs the old code and the drop breaks it.
 
 ## Adding new migrations
 
