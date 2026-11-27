@@ -148,6 +148,13 @@ def draw_mark(
     )
 
 
+def _letter_centre(
+    draw: ImageDraw.ImageDraw, font_: ImageFont.FreeTypeFont, letter: str
+) -> float:
+    """Midway between the top of `letter` and the baseline, from the text's y."""
+    return (draw.textbbox((0, 0), letter, font=font_)[1] + font_.getmetrics()[0]) / 2
+
+
 def draw_wordmark(
     draw: ImageDraw.ImageDraw,
     xy: tuple[int, int],
@@ -162,12 +169,13 @@ def draw_wordmark(
     """
     x, y = xy
     start = x
-    if with_mark:
-        mark = round(size * 1.1)
-        draw_mark(draw, (x, y + round(size * 0.12)), mark, palette)
-        x += mark + round(size * 0.5)
     upright = font("serif", size, 600)
     italic = font("serif-italic", size, 400)
+    if with_mark:
+        mark = round(size * 1.1)
+        centre = y + _letter_centre(draw, upright, "P")
+        draw_mark(draw, (x, round(centre - mark / 2)), mark, palette)
+        x += mark + round(size * 0.5)
     draw.text((x, y), "Papers", font=upright, fill=palette.ink)
     x += draw.textlength("Papers ", font=upright)
     draw.text((x, y), "with Code", font=italic, fill=palette.ink_soft)
@@ -274,20 +282,45 @@ def frame(
     else:
         y += px(12)
     draw.line((margin, y, width - margin, y), fill=palette.hairline, width=1)
+    footer_y = footer(draw, size, palette=palette)
+    return Frame(image, draw, scale, margin, y + px(28), footer_y - px(24))
+
+
+def footer(
+    draw: ImageDraw.ImageDraw, size: tuple[int, int], *, palette: Palette = LIGHT
+) -> int:
+    """The standard footer on a paper band: hairline, wordmark left, domain right.
+
+    Returns the hairline's y, where the canvas content above it ends."""
+    width, height = size
+    scale = (width * height / (1200 * 675)) ** 0.5
+    margin = round(72 * scale)
+
+    def px(value: float) -> int:
+        return round(value * scale)
 
     footer_y = height - px(84)
+    draw.rectangle((0, footer_y, width, height), fill=palette.bg)
     draw.line(
         (margin, footer_y, width - margin, footer_y), fill=palette.hairline, width=1
     )
-    draw_wordmark(draw, (margin, footer_y + px(24)), px(26), palette)
+    centre = (footer_y + height) / 2
+    wordmark_size = px(26)
+    wordmark_y = round(
+        centre - _letter_centre(draw, font("serif", wordmark_size, 600), "P")
+    )
+    draw_wordmark(draw, (margin, wordmark_y), wordmark_size, palette)
     domain_font = font("mono", px(18), 400)
     domain_width = tracked_length(draw, DOMAIN, font=domain_font, tracking=0.02)
     draw_tracked(
         draw,
-        (width - margin - domain_width, footer_y + px(32)),
+        (
+            width - margin - domain_width,
+            round(centre - _letter_centre(draw, domain_font, "h")),
+        ),
         DOMAIN,
         font=domain_font,
         fill=palette.ink_faint,
         tracking=0.02,
     )
-    return Frame(image, draw, scale, margin, y + px(28), footer_y - px(24))
+    return footer_y

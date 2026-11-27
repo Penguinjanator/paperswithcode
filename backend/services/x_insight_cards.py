@@ -3,7 +3,8 @@
 Built on the brand frame (`backend/services/brand.py`, `pwc-brand` skill):
 two 1200x675 layouts (X's 16:9 preview), a horizontal bar chart for
 leaderboards and trend scores and a ranked list for top papers, and a 1600x2400
-card that shows page one of a paper's PDF, for multi-image roundups.
+card that shows page one of a paper's PDF above the footer, for paper posts and
+multi-image roundups.
 """
 
 from __future__ import annotations
@@ -13,15 +14,14 @@ import re
 from dataclasses import dataclass
 
 import fitz
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from backend.services.brand import (
     LIGHT,
-    draw_tracked,
     fit_text,
     font,
+    footer,
     frame,
-    tracked_length,
     wrap_text,
 )
 
@@ -110,7 +110,20 @@ def render_list_card(
 
 
 PAGE_CARD_SIZE = (1600, 2400)
+PAGE_CARD_PAD = 48
 _MARGINALIA = re.compile(r"^\s*(\d+|[∗*†].*)\s*$")
+
+
+def _ink_top(page: fitz.Page, left: float, text_top: float) -> float:
+    """Where anything is drawn above the text (a logo, a rule), else `text_top`."""
+    if text_top < 1:
+        return text_top
+    band = page.get_pixmap(
+        clip=fitz.Rect(left, 0, page.rect.width - left, text_top), alpha=False
+    )
+    gray = Image.frombytes("RGB", (band.width, band.height), band.samples).convert("L")
+    ink = gray.point(lambda value: 255 if value < 230 else 0).getbbox()
+    return ink[1] if ink else text_top
 
 
 def _first_page_hero(pdf: bytes, width: int, height: int) -> Image.Image:
@@ -131,7 +144,7 @@ def _first_page_hero(pdf: bytes, width: int, height: int) -> Image.Image:
         if not body:
             raise ValueError("PDF page one has no text")
         left = max(min(b[0] for b in body) - 10, 0)
-        top = max(min(b[1] for b in body) - 10, 0)
+        top = max(_ink_top(page, left, min(b[1] for b in body)) - 10, 0)
         bottom = max(b[3] for b in body) + 8
         end = min(bottom, top + (page.rect.width - 2 * left) * height / width)
         faded = bottom > end
@@ -149,40 +162,136 @@ def _first_page_hero(pdf: bytes, width: int, height: int) -> Image.Image:
     return image
 
 
+def _flatten(artwork: Image.Image) -> Image.Image:
+    rgba = artwork.convert("RGBA")
+    white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(white, rgba).convert("RGB")
+
+
+def _border_colour(art: Image.Image) -> tuple[tuple[int, int, int], bool]:
+    """The mean colour of the artwork's outer frame, and whether the frame is flat."""
+    w, h = art.size
+    edge = max(1, round(min(w, h) * 0.02))
+    strips = [
+        art.crop((0, 0, w, edge)),
+        art.crop((0, h - edge, w, h)),
+        art.crop((0, 0, edge, h)),
+        art.crop((w - edge, 0, w, h)),
+    ]
+    pixels = [pixel for strip in strips for pixel in strip.getdata()]
+    colour = tuple(round(sum(p[i] for p in pixels) / len(pixels)) for i in range(3))
+    spread = sum(max(abs(p[i] - colour[i]) for i in range(3)) for p in pixels) / len(
+        pixels
+    )
+    return colour, spread < 12
+
+
+def _content_box(art: Image.Image, colour: tuple[int, int, int]) -> tuple | None:
+    diff = ImageChops.difference(art, Image.new("RGB", art.size, colour))
+    red, green, blue = diff.split()
+    strongest = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    mask = strongest.point(lambda value: 255 if value > 32 else 0)
+    box = mask.getbbox()
+    if box is None:
+        return None
+    margin = round(max(box[2] - box[0], box[3] - box[1]) * 0.15)
+    return (
+        max(0, box[0] - margin),
+        max(0, box[1] - margin),
+        min(art.width, box[2] + margin),
+        min(art.height, box[3] + margin),
+    )
+
+
+def _feather(size: tuple[int, int]) -> Image.Image:
+    w, h = size
+    ramp = max(2, round(min(w, h) * 0.1))
+    mask = Image.new("L", size, 0)
+    inset = ramp // 2
+    ImageDraw.Draw(mask).rectangle(
+        (inset, inset, w - 1 - inset, h - 1 - inset), fill=255
+    )
+    return mask.filter(ImageFilter.GaussianBlur(ramp / 4))
+
+
+def _fitted_title(
+    draw: ImageDraw.ImageDraw, title: str, width: int, largest: int, lines: int
+) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+    """The largest serif size, down to half of `largest`, that sets `title` whole in `lines`."""
+    size = largest
+    while True:
+        title_font = font("serif", size, 500)
+        wrapped = wrap_text(draw, title, title_font, width, lines + 1)
+        whole = len(wrapped) <= lines and not any(
+            line.endswith("…") for line in wrapped
+        )
+        if whole or size <= largest // 2:
+            return title_font, wrap_text(draw, title, title_font, width, lines)
+        size = round(size * 0.92)
+
+
 def _artwork_hero(
     artwork: Image.Image, title: str, width: int, height: int
 ) -> Image.Image:
-    """A release page's title above its social image, filling `width` × `height`."""
-    title_font = font("serif", round(width / 17), 500)
-    pad = round(width * 0.04)
-    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    lines = wrap_text(probe, title, title_font, width - 2 * pad, 3) if title else []
-    line_height = round(title_font.size * 1.2)
-    text_height = pad + len(lines) * line_height + pad if lines else 0
-    rgba = artwork.convert("RGBA")
-    art = Image.alpha_composite(
-        Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba
-    ).convert("RGB")
-    art_width = width - 2 * pad
-    art_height = round(art.height * art_width / art.width)
-    room = height - text_height - pad
-    if art_height > room:
-        art_width, art_height = round(art_width * room / art_height), room
-    art = art.resize((art_width, art_height), Image.LANCZOS)
-    image = Image.new("RGB", (width, height), (255, 255, 255))
-    draw = ImageDraw.Draw(image)
+    """A release page's title above its social image, filling `width` × `height`.
+
+    Artwork on a flat backdrop is cropped to its content and set on that
+    backdrop's colour; a photo is set on a dimmed, blurred copy of itself."""
+    art = _flatten(artwork)
+    colour, flat = _border_colour(art)
+    pad = round(width * 0.06)
+    if flat:
+        box = _content_box(art, colour)
+        art = art.crop(box) if box else art
+        image = Image.new("RGB", (width, height), colour)
+        dark = sum(colour) / 3 < 128
+    else:
+        scale = max(width / art.width, height / art.height)
+        cover = art.resize(
+            (
+                max(width, round(art.width * scale)),
+                max(height, round(art.height * scale)),
+            ),
+            Image.LANCZOS,
+        )
+        left = (cover.width - width) // 2
+        top = (cover.height - height) // 2
+        cover = cover.crop((left, top, left + width, top + height))
+        cover = cover.filter(ImageFilter.GaussianBlur(round(width / 20)))
+        image = Image.blend(cover, Image.new("RGB", (width, height), (0, 0, 0)), 0.45)
+        dark = True
+    probe = ImageDraw.Draw(image)
+    title_font, lines = _fitted_title(
+        probe, title, width - 2 * pad, round(width / 11), 4
+    )
+    lines = lines if title else []
+    line_height = round(title_font.size * 1.15)
+    text_height = pad + len(lines) * line_height if lines else 0
     for index, line in enumerate(lines):
-        draw.text((pad, pad + index * line_height), line, font=title_font, fill=P.ink)
-    image.paste(art, ((width - art_width) // 2, text_height + (room - art_height) // 2))
+        probe.text(
+            (pad, pad + index * line_height),
+            line,
+            font=title_font,
+            fill=(255, 255, 255) if dark else P.ink,
+        )
+    room_top = text_height + pad
+    room = height - room_top - pad
+    limit = 1.5 if flat else 4.0
+    scale = min((width - 2 * pad) / art.width, room / art.height, limit)
+    size = (max(1, round(art.width * scale)), max(1, round(art.height * scale)))
+    art = art.resize(size, Image.LANCZOS)
+    position = ((width - size[0]) // 2, room_top + (room - size[1]) // 2)
+    image.paste(art, position, _feather(size) if flat else None)
     return image
 
 
 def _title_hero(title: str, width: int, height: int) -> Image.Image:
     """A paper's title alone, centred on a `width` × `height` sheet."""
-    title_font = font("serif", round(width / 12), 500)
     pad = round(width * 0.06)
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    lines = wrap_text(probe, title, title_font, width - 2 * pad, 4)
+    title_font, lines = _fitted_title(
+        probe, title, width - 2 * pad, round(width / 12), 4
+    )
     line_height = round(title_font.size * 1.2)
     top = max(pad, (height - len(lines) * line_height) // 2)
     image = Image.new("RGB", (width, height), (255, 255, 255))
@@ -192,108 +301,22 @@ def _title_hero(title: str, width: int, height: int) -> Image.Image:
     return image
 
 
-def _fit_sentences(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font_: ImageFont.FreeTypeFont,
-    width: int,
-    lines: int,
-) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", " ".join(text.split()))
-    for count in range(len(sentences), 0, -1):
-        wrapped = wrap_text(draw, " ".join(sentences[:count]), font_, width, lines + 1)
-        if len(wrapped) <= lines:
-            return wrapped
-    return wrap_text(draw, sentences[0], font_, width, lines)
-
-
 def render_paper_page_card(
-    pdf: bytes | Image.Image | None,
-    *,
-    title: str,
-    subtitle: str,
-    eyebrow: str,
-    counter: str,
-    source: str,
-    summary: str,
-    paper_title: str = "",
+    pdf: bytes | Image.Image | None, *, paper_title: str = ""
 ) -> bytes:
-    """A 2:3 card that shows page one of a paper's PDF with a why-read-it line.
+    """A 2:3 card: page one of a paper's PDF above the brand footer.
 
     A release without a PDF passes its page's social image instead, shown
-    under `paper_title`; with neither, the sheet shows `paper_title` alone."""
-    width = PAGE_CARD_SIZE[0]
-    card = frame(
-        PAGE_CARD_SIZE,
-        title=title,
-        subtitle=subtitle,
-        eyebrow=eyebrow,
-        palette=P,
-        title_size=40,
-        title_lines=2,
-    )
-    draw, px, margin = card.draw, card.px, card.margin
-    counter_font = font("mono", px(17), 500)
-    counter_width = tracked_length(draw, counter, font=counter_font, tracking=0.12)
-    draw_tracked(
-        draw,
-        (width - margin - counter_width, px(56)),
-        counter,
-        font=counter_font,
-        fill=P.ink_faint,
-        tracking=0.12,
-    )
-
-    summary_font = font("sans", px(19))
-    lines = _fit_sentences(draw, summary, summary_font, width - 2 * margin, 4)
-    line_height = round(summary_font.size * 1.45)
-    summary_top = card.bottom - len(lines) * line_height - px(34)
-    draw_tracked(
-        draw,
-        (margin, summary_top),
-        "WHY READ IT",
-        font=font("mono", px(14), 500),
-        fill=P.accent,
-        tracking=0.12,
-    )
-    for index, line in enumerate(lines):
-        draw.text(
-            (margin, summary_top + px(34) + index * line_height),
-            line,
-            font=summary_font,
-            fill=P.ink,
-        )
-
-    pad = px(14)
-    sheet_top = card.top
-    inner_width = width - 2 * margin - 2 * pad
-    inner_height = summary_top - px(64) - sheet_top - 2 * pad
+    under `paper_title`; with neither, the card shows `paper_title` alone."""
+    image = Image.new("RGB", PAGE_CARD_SIZE, (255, 255, 255))
+    footer_y = footer(ImageDraw.Draw(image), PAGE_CARD_SIZE, palette=P)
+    width = PAGE_CARD_SIZE[0] - 2 * PAGE_CARD_PAD
+    height = footer_y - PAGE_CARD_PAD
     if pdf is None:
-        page = _title_hero(paper_title, inner_width, inner_height)
+        page = _title_hero(paper_title, width, height)
     elif isinstance(pdf, Image.Image):
-        page = _artwork_hero(pdf, paper_title, inner_width, inner_height)
+        page = _artwork_hero(pdf, paper_title, width, height)
     else:
-        page = _first_page_hero(pdf, inner_width, inner_height)
-    if page.height > inner_height:
-        page = page.resize(
-            (round(page.width * inner_height / page.height), inner_height),
-            Image.LANCZOS,
-        )
-    sheet_bottom = sheet_top + page.height + 2 * pad
-    draw.rounded_rectangle(
-        (margin, sheet_top, width - margin, sheet_bottom),
-        radius=px(8),
-        fill=(255, 255, 255),
-        outline=P.hairline_strong,
-        width=2,
-    )
-    card.image.paste(
-        page, (margin + pad + (inner_width - page.width) // 2, sheet_top + pad)
-    )
-    draw.text(
-        (margin, sheet_bottom + px(10)),
-        source,
-        font=font("mono", px(13)),
-        fill=P.ink_faint,
-    )
-    return _png(card.image)
+        page = _first_page_hero(pdf, width, height)
+    image.paste(page, (PAGE_CARD_PAD, PAGE_CARD_PAD))
+    return _png(image)
