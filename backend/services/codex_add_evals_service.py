@@ -109,6 +109,7 @@ CURATOR_COMMAND = "exec python3 /runner/run_paper_curation.py"
 PI_CURATOR_COMMAND = "exec python3 /runner/run_pi_curation.py"
 PI_SHADOW_TRIGGER = "pi-shadow"
 PI_SHADOW_KINDS = frozenset({"enrich-paper", "add-evals"})
+PI_LIVE_TRIGGER = "hf-daily-cron"
 RELEASE_MERGE_ERROR_PREFIX = "External release merge failed: "
 CURATION_DISPATCH_LOCK_ID = 0x50574344
 CURATOR_BOOTSTRAP_PATHS = (
@@ -413,6 +414,84 @@ def _runner_fields(settings: Settings, runner: str, kind: str) -> dict[str, str]
         "model": settings.codex_jobs_model,
         "reasoning_effort": settings.codex_jobs_reasoning_effort,
         "codex_cli_version": settings.codex_jobs_cli_version,
+    }
+
+
+def is_pi_shadow(row: PaperCurationJob) -> bool:
+    return getattr(row, "trigger", "admin") == PI_SHADOW_TRIGGER
+
+
+def live_runner(settings: Settings, row: PaperCurationJob) -> str:
+    """Runner that applies a non-shadow job; Pi has replaced Codex for daily enrich."""
+    if (
+        settings.curation_enrich_runner == "pi"
+        and row.kind == "enrich-paper"
+        and getattr(row, "trigger", "admin") == PI_LIVE_TRIGGER
+    ):
+        return "pi"
+    return "codex"
+
+
+def daily_runner_outcomes(db: Session, since: datetime) -> list[dict]:
+    """Finished daily-curation jobs per runner and stage, shadow jobs excluded."""
+    outcomes: dict[tuple[str, str], dict] = {}
+    for runner, kind, status, count in (
+        db.query(
+            PaperCurationJob.runner,
+            PaperCurationJob.kind,
+            PaperCurationJob.status,
+            func.count(PaperCurationJob.id),
+        )
+        .filter(
+            PaperCurationJob.trigger == PI_LIVE_TRIGGER,
+            PaperCurationJob.created_at >= since,
+            PaperCurationJob.status.in_(("completed", "failed")),
+        )
+        .group_by(
+            PaperCurationJob.runner, PaperCurationJob.kind, PaperCurationJob.status
+        )
+        .all()
+    ):
+        entry = outcomes.setdefault(
+            (runner, kind),
+            {"runner": runner, "kind": kind, "completed": 0, "failed": 0},
+        )
+        entry[status] = int(count)
+    return [outcomes[key] for key in sorted(outcomes)]
+
+
+def runner_summary(db: Session, settings: Settings) -> dict:
+    """Which runner does daily curation, how each fared this week, and Pi shadow state."""
+    since = _now() - timedelta(days=7)
+    shadow = dict(
+        db.query(PaperCurationJob.status, func.count(PaperCurationJob.id))
+        .filter(
+            PaperCurationJob.trigger == PI_SHADOW_TRIGGER,
+            PaperCurationJob.created_at >= since,
+        )
+        .group_by(PaperCurationJob.status)
+        .all()
+    )
+    unjudged = (
+        db.query(func.count(PaperCurationJob.id))
+        .filter(
+            PaperCurationJob.trigger == PI_SHADOW_TRIGGER,
+            PaperCurationJob.pair_diff.isnot(None),
+            PaperCurationJob.pair_judgment.is_(None),
+        )
+        .scalar()
+    )
+    return {
+        "enrich_runner": settings.curation_enrich_runner,
+        "codex_model": settings.codex_jobs_model,
+        "pi_model": settings.curation_pi_model,
+        "daily_last_7_days": daily_runner_outcomes(db, since),
+        "shadow": {
+            "sample_rate": settings.curation_pi_shadow_sample_rate,
+            "completed_last_7_days": int(shadow.get("completed", 0)),
+            "failed_last_7_days": int(shadow.get("failed", 0)),
+            "pairs_unjudged": int(unjudged or 0),
+        },
     }
 
 
@@ -797,7 +876,7 @@ class CodexPaperJobService:
                 db.query(PaperCurationJob)
                 .filter(
                     PaperCurationJob.status.in_(ACTIVE_STATUSES),
-                    PaperCurationJob.runner == "codex",
+                    PaperCurationJob.trigger != PI_SHADOW_TRIGGER,
                 )
                 .all()
             )
@@ -902,7 +981,7 @@ class CodexPaperJobService:
             db.query(PaperCurationJob)
             .filter(
                 PaperCurationJob.status.in_(ACTIVE_STATUSES),
-                PaperCurationJob.runner == "codex",
+                PaperCurationJob.trigger != PI_SHADOW_TRIGGER,
             )
             .all()
         )
@@ -1155,6 +1234,12 @@ class CodexPaperJobService:
                     error,
                 )
                 return
+        if not is_pi_shadow(row):
+            runner = live_runner(settings, row)
+            if getattr(row, "runner", "codex") != runner:
+                row.runner = runner
+                for field, value in _runner_fields(settings, runner, row.kind).items():
+                    setattr(row, field, value)
         pi = getattr(row, "runner", "codex") == "pi"
         if (
             not settings.codex_jobs_namespace
@@ -1253,7 +1338,7 @@ class CodexPaperJobService:
         active = (
             db.query(func.count(PaperCurationJob.id))
             .filter(
-                PaperCurationJob.runner == "pi",
+                PaperCurationJob.trigger == PI_SHADOW_TRIGGER,
                 PaperCurationJob.status.in_(ACTIVE_STATUSES),
             )
             .scalar()
@@ -1312,7 +1397,7 @@ class CodexPaperJobService:
         Sessions do not autoflush, so pending terminal states (a reconcile
         batch may end both halves) are flushed before the locked re-read.
         """
-        pi = getattr(row, "runner", "codex") == "pi"
+        pi = is_pi_shadow(row)
         if not pi and (
             getattr(row, "trigger", "admin") != "hf-daily-cron"
             or row.kind not in PI_SHADOW_KINDS
@@ -1508,12 +1593,15 @@ class CodexPaperJobService:
         policy_version: str | None = None,
         cohort_date: date | None = None,
         review_status: str | None = None,
+        runner: str | None = None,
     ) -> CodexPaperJobsResponse:
         """Return recent curation history plus counts for the full durable queue."""
         self.reconcile_if_due(db, settings)
         query = db.query(PaperCurationJob)
         if trigger:
             query = query.filter(PaperCurationJob.trigger == trigger)
+        if runner:
+            query = query.filter(PaperCurationJob.runner == runner)
         if status:
             query = query.filter(PaperCurationJob.status == status)
         if policy_version:
@@ -1689,6 +1777,7 @@ class CodexPaperJobService:
                     else "healthy"
                 ),
                 "usage": scheduled_usage,
+                "runners": runner_summary(db, settings),
             },
         )
 
